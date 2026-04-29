@@ -40,12 +40,28 @@ Apache-2.0 license metadata. It is not an official Talkie release.
 Later model-card-only commits may move this repo's HEAD without changing the
 validated ONNX artifacts.
 
+## Quantization At A Glance
+
+The default browser artifact is **10.58 GB**, down from the **26.56 GB** BF16
+source weights: about **60% smaller** and **2.5x compressed**. The q8 fallback is
+**15.31 GB**, about **42% smaller** than the source.
+
+| Artifact | Size | Reduction vs source | Notes |
+| --- | ---: | ---: | --- |
+| BF16 source safetensors | 26.56 GB | baseline | `lewtun/talkie-1930-13b-it-hf` |
+| q4f16 ONNX default | 10.58 GB | 60% smaller | Nominal q4 weights; roughly 6.4 bits/parameter on disk |
+| q8 ONNX fallback | 15.31 GB | 42% smaller | Roughly 9.2 bits/parameter on disk |
+
+The q4f16 file is larger than a theoretical pure 4-bit checkpoint because ONNX
+stores scales, metadata, and some unquantized tensors; this artifact also keeps
+runtime tensors in float32 where needed for WebGPU stability.
+
 ## Files
 
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |
-| `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Default browser path | 10 |
-| `onnx/model_quantized.onnx` | q8 | Fallback path | 15 |
+| `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Default browser path, 10.58 GB | 10 |
+| `onnx/model_quantized.onnx` | q8 | Fallback path, 15.31 GB | 15 |
 
 The `config.json` includes the Transformers.js external-data chunk map used by
 the browser loader.
