@@ -172,14 +172,24 @@ button:disabled {
   color: #5b5b54;
 }
 
+.meter-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .meter span {
   overflow-wrap: anywhere;
 }
 
-.meter progress {
-  width: 100%;
-  height: 10px;
-  accent-color: #9b1c31;
+.meter strong {
+  min-width: 48px;
+  color: #151514;
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: right;
 }
 
 .project-links {

@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useRef, useState } from "react";
+import { type FormEvent, type MutableRefObject, useMemo, useRef, useState } from "react";
 import {
   ExternalLink,
   Gauge,
@@ -35,6 +35,30 @@ const defaultSettings: GenerationSettings = {
   topK: 50
 };
 
+type LoadTarget = "q4f16" | "q8";
+
+interface FileLoadState {
+  loaded: number;
+  total: number;
+}
+
+interface LoadMeter {
+  label: string;
+  detail: string;
+  percent: number | null;
+}
+
+const DEFAULT_LOAD_METER: LoadMeter = {
+  label: "Not loaded",
+  detail: "main",
+  percent: null
+};
+
+const TARGET_TOTAL_BYTES: Record<LoadTarget, number> = {
+  q4f16: 10_583_998_959,
+  q8: 15_312_926_922
+};
+
 function App() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [draft, setDraft] = useState("");
@@ -42,16 +66,19 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [status, setStatus] = useState("Idle");
-  const [progress, setProgress] = useState<LoadProgress | null>(null);
+  const [loadMeter, setLoadMeter] = useState<LoadMeter>(DEFAULT_LOAD_METER);
   const [dtype, setDtype] = useState("unloaded");
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const loadFilesRef = useRef<Map<string, FileLoadState>>(new Map());
+  const loadTargetRef = useRef<LoadTarget | null>(null);
+  const bestLoadPercentRef = useRef(0);
 
   const defaults = useMemo(() => modelDefaults(), []);
   const gpuReady = hasWebGPU();
 
   const handleProgress = (event: LoadProgress) => {
-    setProgress(event);
+    setLoadMeter(updateLoadMeter(event, loadFilesRef.current, loadTargetRef, bestLoadPercentRef));
     if (event.status) setStatus(event.status);
   };
 
@@ -59,13 +86,31 @@ function App() {
     setError(null);
     setLoading(true);
     setStatus("Loading");
+    loadFilesRef.current.clear();
+    loadTargetRef.current = null;
+    bestLoadPercentRef.current = 0;
+    setLoadMeter({
+      label: "Preparing model",
+      detail: "Fetching tokenizer and config",
+      percent: 0
+    });
     try {
       const runtime = await loadTalkieRuntime(handleProgress);
       setDtype(runtime.session.dtype);
       setStatus("Ready");
+      setLoadMeter({
+        label: "Ready",
+        detail: `Loaded ${runtime.session.dtype}`,
+        percent: 100
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStatus("Error");
+      setLoadMeter({
+        label: "Load failed",
+        detail: "See error message",
+        percent: null
+      });
     } finally {
       setLoading(false);
     }
@@ -78,7 +123,10 @@ function App() {
     try {
       await resetTalkieRuntime();
       setDtype("unloaded");
-      setProgress(null);
+      loadFilesRef.current.clear();
+      loadTargetRef.current = null;
+      bestLoadPercentRef.current = 0;
+      setLoadMeter(DEFAULT_LOAD_METER);
       setStatus("Idle");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -222,8 +270,11 @@ function App() {
             </label>
 
             <div className="meter">
-              <span>{progress?.file ?? defaults.revision}</span>
-              <progress value={progress?.progress ?? 0} max={100} />
+              <div className="meter-header">
+                <span>{loadMeter.label}</span>
+                <strong>{loadMeter.percent == null ? "--" : `${loadMeter.percent}%`}</strong>
+              </div>
+              <span>{loadMeter.detail || defaults.revision}</span>
             </div>
 
             <nav className="project-links" aria-label="Project links">
@@ -275,6 +326,79 @@ function App() {
       </section>
     </main>
   );
+}
+
+function updateLoadMeter(
+  event: LoadProgress,
+  files: Map<string, FileLoadState>,
+  targetRef: MutableRefObject<LoadTarget | null>,
+  bestPercentRef: MutableRefObject<number>
+): LoadMeter {
+  const file = event.file ?? "";
+  const target = detectLoadTarget(file);
+  if (target) targetRef.current = target;
+
+  const loaded = finiteNumber(event.loaded);
+  const total = finiteNumber(event.total);
+  if (file && loaded != null && total != null && total > 0) {
+    files.set(file, {
+      loaded: Math.min(Math.max(loaded, 0), total),
+      total
+    });
+  }
+
+  const activeTarget = targetRef.current;
+  const rawPercent = activeTarget
+    ? aggregateTargetPercent(files, activeTarget)
+    : metadataPercent(event.progress);
+  const nextPercent =
+    rawPercent == null
+      ? bestPercentRef.current
+      : Math.max(bestPercentRef.current, Math.min(99, Math.floor(rawPercent)));
+  bestPercentRef.current = nextPercent;
+
+  return {
+    label: activeTarget ? `Loading ${activeTarget}` : "Preparing model",
+    detail: readableProgressDetail(file, event.status),
+    percent: nextPercent
+  };
+}
+
+function aggregateTargetPercent(files: Map<string, FileLoadState>, target: LoadTarget): number {
+  const needle = target === "q8" ? "model_quantized.onnx" : "model_q4f16.onnx";
+  let loaded = 0;
+  for (const [file, state] of files) {
+    if (file.includes(needle)) loaded += state.loaded;
+  }
+  return (loaded / TARGET_TOTAL_BYTES[target]) * 100;
+}
+
+function detectLoadTarget(file: string): LoadTarget | null {
+  if (file.includes("model_quantized.onnx")) return "q8";
+  if (file.includes("model_q4f16.onnx")) return "q4f16";
+  return null;
+}
+
+function metadataPercent(progress: number | undefined): number | null {
+  const percent = finiteNumber(progress);
+  if (percent == null) return null;
+  return Math.min(3, Math.max(0, percent / 40));
+}
+
+function readableProgressDetail(file: string, status: string | undefined): string {
+  if (!file) return status ? sentenceCase(status) : "Fetching model metadata";
+  const clean = file.split(/[?#]/)[0].split("/").filter(Boolean).at(-1);
+  return clean ?? file;
+}
+
+function finiteNumber(value: unknown): number | null {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sentenceCase(value: string): string {
+  if (!value) return value;
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 export default App;
