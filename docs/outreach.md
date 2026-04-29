@@ -1,0 +1,55 @@
+# Outreach Templates
+
+These are drafts only. Do not post automatically.
+
+## Hugging Face Community
+
+Title: Browser-ready q4f16/q8 ONNX WebGPU quantization for Talkie 1930 13B
+
+I published an unofficial community ONNX/WebGPU quantization of Talkie 1930 13B:
+
+- Model: https://huggingface.co/scasella91/talkie-1930-13b-it-ONNX
+- Live browser demo: https://scasella.github.io/talkie-quant-webgpu/
+- GitHub runner/scripts: https://github.com/scasella/talkie-quant-webgpu
+
+It includes a q4f16 default artifact, q8 fallback, tokenizer/config/chat
+template, and a Transformers.js browser runner with a manual full-sequence
+generation loop. This is not an official Talkie release, but it should make the
+model much easier to try from a local browser with WebGPU.
+
+## GitHub Release
+
+Talkie Quant WebGPU v0.1.0 publishes the first community browser-ready ONNX path
+for Talkie 1930 13B:
+
+- q4f16 default ONNX artifact with 10 external-data chunks
+- q8 fallback with 15 external-data chunks
+- Static React/Vite WebGPU chat demo using Transformers.js
+- Manual Talkie generation loop, token `0` suppression, and stop IDs
+  `65535`/`65536`
+- Advanced Modal scripts for reproducing the export
+
+Try the demo: https://scasella.github.io/talkie-quant-webgpu/
+
+## Discord Or Social
+
+Talkie 1930 13B now has an unofficial browser/WebGPU quant:
+https://huggingface.co/scasella91/talkie-1930-13b-it-ONNX
+
+I also published a static demo and runner:
+https://scasella.github.io/talkie-quant-webgpu/
+
+It loads q4f16 by default, falls back to q8, and runs fully client-side with
+Transformers.js. First load is big, but it finally makes Talkie tryable without
+setting up a CUDA box.
+
+## Note To Original Talkie Community
+
+I made an unofficial community ONNX/WebGPU quantization of Talkie 1930 13B for
+browser use. The repo preserves the source tokenizer, chat template, generation
+config, and Apache-2.0 metadata, and links clearly back to the original Talkie
+project and HF Transformers-format conversion.
+
+Model: https://huggingface.co/scasella91/talkie-1930-13b-it-ONNX
+Demo: https://scasella.github.io/talkie-quant-webgpu/
+Code: https://github.com/scasella/talkie-quant-webgpu

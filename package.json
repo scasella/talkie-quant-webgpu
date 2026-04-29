@@ -1,0 +1,49 @@
+{
+  "name": "talkie-quant-webgpu",
+  "version": "0.1.0",
+  "description": "Unofficial Talkie 1930 13B q4f16/q8 ONNX WebGPU browser demo.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "homepage": "https://scasella.github.io/talkie-quant-webgpu/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scasella/talkie-quant-webgpu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/scasella/talkie-quant-webgpu/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "talkie",
+    "transformers.js",
+    "webgpu",
+    "onnx",
+    "hugging-face",
+    "quantization",
+    "browser-ai",
+    "llm",
+    "text-generation"
+  ],
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc && vite build",
+    "build:pages": "VITE_BASE_PATH=/talkie-quant-webgpu/ npm run build",
+    "preview": "vite preview --host 127.0.0.1",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.2.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}
