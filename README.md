@@ -54,11 +54,14 @@ Default model repo:
 scasella91/talkie-1930-13b-it-ONNX
 ```
 
-Validated Hub commit:
+Validated artifact commit:
 
 ```text
 addb95a08622583a3017576e9442a9d6853e88c1
 ```
+
+Later model-card-only commits may move the Hub repo HEAD without changing these
+ONNX artifacts.
 
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |

@@ -29,13 +29,16 @@ for browser inference with Transformers.js.
 - Live browser demo: <https://scasella.github.io/talkie-quant-webgpu/>
 - GitHub runner and export scripts: <https://github.com/scasella/talkie-quant-webgpu>
 - Source model revision: `6311dedf518470856a8503f2080bb4b54fcb3323`
-- Validated ONNX repo commit: `addb95a08622583a3017576e9442a9d6853e88c1`
+- Validated ONNX artifact commit: `addb95a08622583a3017576e9442a9d6853e88c1`
 - Default browser dtype: `q4f16`
 - Fallback dtype: `q8`
 - Stop token IDs: `[65535, 65536]`
 
 This model keeps the source tokenizer, chat template, generation config, and
 Apache-2.0 license metadata. It is not an official Talkie release.
+
+Later model-card-only commits may move this repo's HEAD without changing the
+validated ONNX artifacts.
 
 ## Files
 

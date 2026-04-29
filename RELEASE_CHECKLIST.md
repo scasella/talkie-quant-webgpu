@@ -7,7 +7,7 @@ Use this checklist before publishing or tagging the repo.
 - GitHub repo: `scasella/talkie-quant-webgpu`
 - Live demo: `https://scasella.github.io/talkie-quant-webgpu/`
 - Hub repo: `scasella91/talkie-1930-13b-it-ONNX`
-- Validated commit: `addb95a08622583a3017576e9442a9d6853e88c1`
+- Validated ONNX artifact commit: `addb95a08622583a3017576e9442a9d6853e88c1`
 - Browser default: `onnx/model_q4f16.onnx`
 - q4 external-data chunks: `10`
 - q8 fallback: `onnx/model_quantized.onnx`
