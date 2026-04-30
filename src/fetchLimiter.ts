@@ -1,5 +1,9 @@
-const DEFAULT_MAX_PARALLEL_MODEL_FETCHES = 6;
+const DEFAULT_MAX_PARALLEL_MODEL_FETCHES = 4;
+const DEFAULT_COMPRESSED_MAX_PARALLEL_MODEL_FETCHES = 8;
 const MAX_ATTEMPTS = 4;
+const RUNTIME_PARAMS = typeof window === "undefined" ? new URLSearchParams() : new URLSearchParams(window.location.search);
+const COMPRESSED_EXTERNAL_DATA_ENABLED =
+  RUNTIME_PARAMS.get("compressed") === "1" || import.meta.env.VITE_TALKIE_COMPRESSED_EXTERNAL_DATA === "1";
 
 let installed = false;
 let activeFetches = 0;
@@ -22,6 +26,10 @@ export function setTalkieFetchProgressListener(listener: TalkieFetchProgressList
   progressListener = listener;
 }
 
+export function talkieFetchConcurrency(): number {
+  return maxParallelFetches();
+}
+
 export function installTalkieFetchLimiter(): void {
   if (installed || typeof window === "undefined") return;
   if (import.meta.env.VITE_TALKIE_FETCH_LIMITER === "0") return;
@@ -38,7 +46,9 @@ function maxParallelFetches(): number {
   const params = new URLSearchParams(window.location.search);
   const configured = Number(params.get("fetches") || import.meta.env.VITE_TALKIE_FETCH_CONCURRENCY || "");
   if (Number.isFinite(configured) && configured >= 1) return Math.floor(configured);
-  return DEFAULT_MAX_PARALLEL_MODEL_FETCHES;
+  return COMPRESSED_EXTERNAL_DATA_ENABLED
+    ? DEFAULT_COMPRESSED_MAX_PARALLEL_MODEL_FETCHES
+    : DEFAULT_MAX_PARALLEL_MODEL_FETCHES;
 }
 
 function isModelFetch(input: RequestInfo | URL): boolean {
@@ -85,9 +95,11 @@ async function fetchWithRetry(
   let lastError: unknown = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetchImpl(cloneFetchInput(input), init);
+      const sourceUrl = fetchUrl(input);
+      const compressedUrl = compressedExternalDataUrl(sourceUrl);
+      const response = await fetchImpl(compressedUrl ? compressedUrl : cloneFetchInput(input), init);
       if (response.ok || (response.status < 500 && response.status !== 429)) {
-        return withProgress(response, fetchUrl(input));
+        return withProgress(compressedUrl ? decompressGzipResponse(response) : response, sourceUrl);
       }
       lastError = new Error(`HTTP ${response.status}`);
     } catch (error) {
@@ -140,6 +152,30 @@ function fetchUrl(input: RequestInfo | URL): string {
 
 function cloneFetchInput(input: RequestInfo | URL): RequestInfo | URL {
   return input instanceof Request ? input.clone() : input;
+}
+
+function compressedExternalDataUrl(url: string): string | null {
+  if (!COMPRESSED_EXTERNAL_DATA_ENABLED || typeof DecompressionStream === "undefined") return null;
+  if (!/\.onnx_data(?:_\d+)?(?:[?#].*)?$/.test(url)) return null;
+  try {
+    const parsed = new URL(url);
+    parsed.pathname = `${parsed.pathname}.gz`;
+    return parsed.toString();
+  } catch {
+    return `${url}.gz`;
+  }
+}
+
+function decompressGzipResponse(response: Response): Response {
+  if (!response.body) return response;
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  return new Response(response.body.pipeThrough(new DecompressionStream("gzip")), {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
 }
 
 function delay(ms: number): Promise<void> {

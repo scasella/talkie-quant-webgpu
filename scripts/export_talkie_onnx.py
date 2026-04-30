@@ -9,6 +9,7 @@ import gc
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,7 @@ FULL_SEQUENCE_ONNX_FILES = ("model_q4f16.onnx", "model_quantized.onnx")
 KV_CACHE_ONNX_FILES = ("model_kv_q4f16.onnx", "model_kv_quantized.onnx")
 FAST_KV_CACHE_ONNX_FILES = ("model_kv_fast_q4f16.onnx", "model_kv_fast_quantized.onnx")
 BROWSER_ONNX_FILES = (*FULL_SEQUENCE_ONNX_FILES, *KV_CACHE_ONNX_FILES, *FAST_KV_CACHE_ONNX_FILES)
+BASE_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 METADATA_FILES = [
     "config.json",
     "tokenizer.json",
@@ -981,7 +983,12 @@ def split_browser_external_data(onnx_dir: Path, chunk_mib: int) -> dict[str, int
         raise ValueError("External data chunk size must be positive")
 
     chunk_counts: dict[str, int] = {}
-    for name in BROWSER_ONNX_FILES:
+    model_names = list(BROWSER_ONNX_FILES)
+    for path in sorted(onnx_dir.glob("*.onnx")):
+        if path.name.endswith("_q4f16.onnx") or path.name.endswith("_quantized.onnx"):
+            if path.name not in model_names:
+                model_names.append(path.name)
+    for name in model_names:
         model_path = onnx_dir / name
         if not model_path.exists():
             continue
@@ -1812,11 +1819,17 @@ def update_transformers_js_config(out_dir: Path, external_data_chunks: dict[str,
     existing_external = transformers_js_config.get("use_external_data_format")
     if not isinstance(existing_external, dict):
         existing_external = {}
-    defaults = {
-        "model_q4f16.onnx": 1,
-        "model_quantized.onnx": 1,
-    }
-    existing_external = {**defaults, **existing_external, **(external_data_chunks or {})}
+    existing_external = {**existing_external, **(external_data_chunks or {})}
+    onnx_dir = out_dir / "onnx"
+    if onnx_dir.exists():
+        for model_path in sorted(onnx_dir.glob("*.onnx")):
+            if model_path.name in existing_external:
+                continue
+            chunk_count = 0
+            while model_path.with_name(data_chunk_name(model_path, chunk_count)).exists():
+                chunk_count += 1
+            if chunk_count:
+                existing_external[model_path.name] = chunk_count
     transformers_js_config["use_external_data_format"] = existing_external
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
@@ -1920,7 +1933,7 @@ WebGPU cached decoding.
 - Default browser dtype: `{default_dtype}`
 - Fallback dtype: `q8`
 - Stop token IDs: `{STOP_TOKEN_IDS}`
-- Best measured browser speed: `3.17 tok/s` reported rolling token latency on
+- Best measured browser speed: `3.60 tok/s` reported rolling token latency on
   a MacBook Pro with M4 Pro and 24 GB unified memory
 
 This model keeps the source tokenizer, chat template, generation config, and
@@ -1960,6 +1973,8 @@ generated token.
 | --- | ---: | ---: | --- |
 | BF16 source safetensors | 26.56&nbsp;GB | baseline | `{source_model}` |
 | Fast cached q4f16 ONNX default | 13.0&nbsp;GB | 51% smaller | Direct ORT KV-cache browser path; q/k quantized, value unquantized |
+| Fast cached q4f16 gzip opt-in | 8.85&nbsp;GB transfer | 67% smaller transfer | Same ONNX graph with gzip-compressed external-data companions; best measured cold-start path, not default |
+| Cold64 cached q4f16 opt-in | 12.25&nbsp;GB | 54% smaller | Same validation profile as fast q4; smaller download, not default because it did not hit the 2x cold-start target |
 | Cached q4f16 ONNX fallback | 16.53&nbsp;GB | 38% smaller | KV-cache fallback; q/k/v projections unquantized |
 | Cached q8 ONNX fallback | 21.60&nbsp;GB | 19% smaller | KV-cache fallback; K/V projections unquantized |
 | Full-sequence q4f16 fallback | 10.58&nbsp;GB | 60% smaller | Smaller download, slower generation |
@@ -2001,16 +2016,30 @@ value projection unquantized. That preserved top-1 agreement on the smoke prompt
 and produced the default `onnx/model_kv_fast_q4f16.onnx`.
 
 Current browser smoke result: `kv-cache` / `ort-direct` generated 16 non-NUL
-words at about `3.17 tok/s` reported rolling token latency and `3.11 tok/s` p50
-token latency, over 5x the original full-sequence steady token rate. Cold load
-is still the big caveat: about `528.7s` to `Ready` and about `43.1s` TTFT in
-the measured run.
+words at about `3.60 tok/s` reported rolling token latency and `3.58 tok/s` p50
+token latency after the default warmup, about 6x the original full-sequence
+steady token rate. Cold load is still the big caveat. A fetch-concurrency sweep
+found `fetches=4` was the best stable default on this machine: without warmup,
+that run measured about `530.6s` to `Ready` and `17.4s` TTFT. With the tiny
+cached-graph warmup enabled by default, the same path measured about `472.4s`
+to `Ready` and `1.1s` TTFT in the latest run. The additive
+`model_kv_cold64_q4f16.onnx` candidate improved the no-warmup Ready time to
+about `484.2s` with about `19.0s` TTFT, but that is only a modest partial win,
+so it remains an opt-in candidate rather than replacing the default. A later
+static-compatible compression experiment added gzip companions for the fast
+q4f16 external-data chunks. That reduced transfer from about `12.97 GB` to
+`8.85 GB`. The best compressed cold-start run used `compressed=1`, `warmup=0`,
+and `fetches=8`, and measured about `316.6s` Ready, `17.3s` TTFT, and
+`3.61 tok/s`. That improves cold load materially, but it still misses the 2x
+cold-start target, so it is documented as opt-in.
 
 ## Files
 
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |
 | `onnx/model_kv_fast_q4f16.onnx` | hybrid q4f16 | Default direct ORT cached browser path, about 13.0&nbsp;GB | 55 |
+| `onnx/model_kv_fast_q4f16.onnx_data*.gz` | gzip external data | Opt-in compressed transfer for the default graph, about 8.85&nbsp;GB | 55 |
+| `onnx/model_kv_cold64_q4f16.onnx` | hybrid q4f16 | Opt-in cold-start candidate, about 12.25&nbsp;GB | 54 |
 | `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Conservative cached fallback, 16.53&nbsp;GB | 32 |
 | `onnx/model_kv_quantized.onnx` | hybrid q8 | Cached fallback path, 21.60&nbsp;GB | 42 |
 | `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Full-sequence fallback, 10.58&nbsp;GB | 22 |
@@ -2038,6 +2067,22 @@ npm run dev
 
 The app defaults to cached q4f16. The smaller full-sequence q4f16 artifact
 remains available as a fallback.
+
+The app also warms a tiny cached decode path after session creation so the first
+visible reply token arrives faster. Opt out with `?warmup=0` when benchmarking
+raw TTFT.
+
+Opt into gzip-compressed external data for the best measured cold-start tradeoff:
+
+```text
+https://scasella.github.io/talkie-quant-webgpu/?compressed=1&warmup=0&fetches=8
+```
+
+Opt into the smaller cold-start candidate without changing the default:
+
+```text
+https://scasella.github.io/talkie-quant-webgpu/?revision=main&q4file=model_kv_cold64_q4f16.onnx&fetches=4
+```
 
 ## Transformers.js Notes
 
@@ -2072,12 +2117,21 @@ ONNX Runtime loading, limited concurrent model fetches, and manual
 - The cached q8 fallback validated against the same reference on the CPU
   provider and is kept as a browser/WebGPU fallback.
 - Chrome on a MacBook Pro with M4 Pro and 24 GB unified memory loaded cached
-  q4f16 with `cache=0`, `opt=disabled`, and `fetches=6`, then generated 16
-  non-NUL words with
-  `kv-cache` / `ort-direct`, about `3.17 tok/s` reported rolling latency, and
-  about `3.11 tok/s` p50 token latency.
-- Cold load remains slow: the measured run took about `528.7s` to `Ready` and
-  about `43.1s` TTFT.
+  q4f16 with `cache=0`, `opt=disabled`, `fetches=4`, and the default warmup,
+  then generated 16 non-NUL words with
+  `kv-cache` / `ort-direct`, about `3.60 tok/s` reported rolling latency, and
+  about `3.58 tok/s` p50 token latency.
+- Cold load remains slow: the default warmup run took about `472.4s` to
+  `Ready`, but TTFT fell to about `1.1s`. The best no-warmup fetch-concurrency
+  run was about `530.6s` Ready / `17.4s` TTFT / `3.69 tok/s`.
+- The additive `model_kv_cold64_q4f16.onnx` candidate validated and loaded, but
+  only improved the same smoke to about `484.2s` Ready / `19.0s` TTFT, so it is
+  documented as opt-in rather than default.
+- The gzip external-data opt-in for `model_kv_fast_q4f16.onnx` validated in the
+  browser at `316.6s` Ready / `17.3s` TTFT / `3.61 tok/s` with `compressed=1`,
+  `warmup=0`, `fetches=8`, `cache=0`, and `opt=disabled`. It improves cold load
+  by about 40% versus the original `528.7s` Ready baseline, but it still misses
+  the `<=265s` Ready target, so it is not the default.
 
 ## Known Limitations
 
@@ -2091,6 +2145,8 @@ ONNX Runtime loading, limited concurrent model fetches, and manual
   latency are still slow.
 - The displayed tok/sec is a rolling token-latency rate, not a cold-start
   average.
+- The compressed opt-in reduces network transfer, but the browser still
+  materializes decompressed ONNX external data for WebGPU session creation.
 - The older full-sequence artifacts remain slower fallbacks.
 
 ## Attribution
@@ -2439,6 +2495,15 @@ def upload_to_hub(
             "onnx/model_kv_fast.onnx_data*",
             "onnx/model_kv_fast_fp16*",
         ]
+    elif not upload_fp_model and base_model_name.startswith("model_kv_"):
+        merge_remote_transformers_js_config(out_dir, repo_id, token)
+        allow_patterns = [
+            "config.json",
+            f"onnx/{base_model_name}_q4f16.onnx",
+            f"onnx/{base_model_name}_q4f16.onnx_data*",
+            f"onnx/{base_model_name}_quantized.onnx",
+            f"onnx/{base_model_name}_quantized.onnx_data*",
+        ]
     elif not upload_fp_model and base_model_name == "browser":
         allow_patterns = [
             "README.md",
@@ -2472,6 +2537,8 @@ def upload_to_hub(
         commit_message = "Add Talkie KV-cache ONNX WebGPU export"
     elif base_model_name == "model_kv_fast":
         commit_message = "Add Talkie fast KV-cache ONNX WebGPU export"
+    elif base_model_name.startswith("model_kv_"):
+        commit_message = f"Add Talkie cold-start candidate {base_model_name}"
     api.upload_folder(
         repo_id=repo_id,
         repo_type="model",
@@ -2492,6 +2559,8 @@ def upload_model_names(base_model_name: str, upload_fp_model: bool) -> tuple[str
         return KV_CACHE_ONNX_FILES
     if base_model_name == "model_kv_fast":
         return FAST_KV_CACHE_ONNX_FILES
+    if base_model_name.startswith("model_kv_"):
+        return (f"{base_model_name}_q4f16.onnx", f"{base_model_name}_quantized.onnx")
     if base_model_name == "browser":
         return BROWSER_ONNX_FILES
     return ()
@@ -2575,6 +2644,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-upload", action="store_true")
     parser.add_argument("--skip-fp-validation", action="store_true")
     parser.add_argument("--skip-quant-validation", action="store_true")
+    parser.add_argument(
+        "--fp-validation-provider",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Provider preference for fp ONNX validation. CPU avoids CUDA arena spikes on large KV exports.",
+    )
     parser.add_argument("--upload-fp-model", action="store_true", help="Upload the large fp model.onnx artifact too")
     parser.add_argument("--prepare-q8-fp16", action="store_true", help="Write onnx/model_fp16.onnx and exit")
     parser.add_argument("--prepare-q8-folded", action="store_true", help="Write onnx/model_fp16_folded.onnx and exit")
@@ -2584,6 +2659,11 @@ def parse_args() -> argparse.Namespace:
         "--kv-cache-fast",
         action="store_true",
         help="Export additive model_kv_fast*.onnx artifacts with KV attention projections quantized.",
+    )
+    parser.add_argument(
+        "--base-model-name",
+        default=None,
+        help="Override the ONNX base filename for additive experiments, e.g. model_kv_cold64.",
     )
     parser.add_argument("--kv-export-past-len", type=int, default=1, help="Dummy past length used when tracing the KV-cache graph")
     parser.add_argument(
@@ -2602,6 +2682,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external-data-chunk-mib", type=int, default=DEFAULT_EXTERNAL_DATA_CHUNK_MIB)
     parser.add_argument("--legacy-export", action="store_true", help="Use legacy torch.onnx exporter")
     return parser.parse_args()
+
+
+def resolve_base_model_name(override: str | None, kv_cache: bool, kv_cache_fast: bool) -> str:
+    if not override:
+        return "model_kv_fast" if kv_cache_fast else ("model_kv" if kv_cache else "model")
+    if not BASE_MODEL_NAME_RE.fullmatch(override):
+        raise ValueError("--base-model-name may contain only letters, digits, underscore, dot, and dash")
+    if "/" in override or "\\" in override or override in {".", ".."}:
+        raise ValueError("--base-model-name must be a bare filename stem, not a path")
+    if kv_cache and not override.startswith("model_kv_"):
+        raise ValueError("custom KV-cache base names must start with model_kv_")
+    if not kv_cache and override != "model":
+        raise ValueError("custom base names are currently supported only for KV-cache exports")
+    return override
+
+
+def validation_providers(name: str) -> list[str] | None:
+    if name == "cpu":
+        return ["CPUExecutionProvider"]
+    if name == "cuda":
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return None
 
 
 def resolve_torch_dtype(name: str) -> torch.dtype:
@@ -2631,7 +2733,8 @@ def main() -> None:
     work_dir = Path(args.work_dir)
     out_dir = work_dir / "hub"
     onnx_dir = out_dir / "onnx"
-    base_model_name = "model_kv_fast" if args.kv_cache_fast else ("model_kv" if args.kv_cache else "model")
+    base_model_name = resolve_base_model_name(args.base_model_name, args.kv_cache, args.kv_cache_fast)
+    fp_validation_providers = validation_providers(args.fp_validation_provider)
     model_path = onnx_dir / f"{base_model_name}.onnx"
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -2671,7 +2774,7 @@ def main() -> None:
                 args.private,
                 token,
                 upload_fp_model=args.upload_fp_model,
-                base_model_name="browser",
+                base_model_name=base_model_name if args.base_model_name else "browser",
             )
         print("DONE", flush=True)
         return
@@ -2747,6 +2850,7 @@ def main() -> None:
                     name="fp_export_kv",
                     reference_top5=reference_top5,
                     require_top1_match=True,
+                    providers=fp_validation_providers,
                 )
             else:
                 result = validate_onnx(
@@ -2755,6 +2859,7 @@ def main() -> None:
                     "fp_export",
                     reference_top5=reference_top5,
                     require_top1_match=True,
+                    providers=fp_validation_providers,
                 )
             if not result.passed:
                 raise RuntimeError("ONNX export validation failed")
@@ -2801,6 +2906,7 @@ def main() -> None:
                     "fp_export_kv",
                     reference_top5=reference_top5,
                     require_top1_match=True,
+                    providers=fp_validation_providers,
                 )
             else:
                 result = validate_onnx(
@@ -2809,6 +2915,7 @@ def main() -> None:
                     "fp_export",
                     reference_top5=reference_top5,
                     require_top1_match=True,
+                    providers=fp_validation_providers,
                 )
             if not result.passed:
                 raise RuntimeError("ONNX export validation failed")

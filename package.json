@@ -38,6 +38,7 @@
     "build:pages": "VITE_BASE_PATH=/talkie-quant-webgpu/ npm run build",
     "preview": "vite preview --host 127.0.0.1",
     "benchmark:browser": "node scripts/benchmark_browser_latency.mjs",
+    "benchmark:fetch-matrix": "node scripts/benchmark_fetch_matrix.mjs",
     "diagnose:browser": "node scripts/diagnose_browser_load.mjs",
     "diagnose:ort": "node scripts/diagnose_ort_direct.mjs",
     "lint": "tsc --noEmit"

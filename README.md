@@ -9,10 +9,14 @@ tokenizer/chat-template handling and direct ONNX Runtime WebGPU for the default
 cached graph. There is no backend and no browser-exposed credential.
 The demo now defaults to a direct ONNX Runtime WebGPU KV-cache path. On a
 MacBook Pro with M4 Pro and 24 GB unified memory, the additive fast cached
-q4f16 artifact generated 16 non-NUL words in Chrome/WebGPU at about **3.17
-tok/s reported rolling latency** / **3.11 tok/s p50 token latency** after cold
-load. First load is still large and slow, and first-token latency is still
-called out below.
+q4f16 artifact generated 16 non-NUL words in Chrome/WebGPU at about **3.60
+tok/s reported rolling latency** / **3.58 tok/s p50 token latency** in the
+latest default warmup benchmark. First load is still large and slow, but the
+post-load warmup reduced measured TTFT to about **1.1s**.
+An opt-in gzip external-data path cuts the default q4f16 transfer from about
+13.0 GB to **8.85 GB** and reached **316.6s Ready / 17.3s TTFT** in the best
+measured cold-start run. That is a real improvement, but it did not hit the
+265s Ready target, so it remains opt-in.
 
 - Live demo: <https://scasella.github.io/talkie-quant-webgpu/>
 - Hugging Face model: <https://huggingface.co/scasella91/talkie-1930-13b-it-ONNX>
@@ -30,6 +34,8 @@ avoids rerunning the full prompt every generated token.
 | --- | ---: | ---: | --- |
 | BF16 source safetensors | 26.56&nbsp;GB | baseline | `lewtun/talkie-1930-13b-it-hf` |
 | Fast cached q4f16 ONNX default | 13.0&nbsp;GB | 51% smaller | Direct ORT KV-cache browser path; q/k quantized, value unquantized |
+| Fast cached q4f16 gzip opt-in | 8.85&nbsp;GB transfer | 67% smaller transfer | Same ONNX graph with gzip-compressed external-data companions; best measured cold-start path, not default |
+| Cold64 cached q4f16 opt-in | 12.25&nbsp;GB | 54% smaller | Same validation profile as fast q4; smaller download, not default because it did not hit the 2x cold-start target |
 | Cached q4f16 ONNX fallback | 16.53&nbsp;GB | 38% smaller | KV-cache fallback; most MatMuls q4, q/k/v projections unquantized |
 | Cached q8 ONNX fallback | 21.60&nbsp;GB | 19% smaller | KV-cache fallback; K/V projections unquantized |
 | Full-sequence q4f16 fallback | 10.58&nbsp;GB | 60% smaller | Smaller download, slower generation |
@@ -77,11 +83,22 @@ projection unquantized. That version preserved top-1 agreement on the smoke
 prompt and produced the current default `model_kv_fast_q4f16.onnx` artifact.
 
 Current measured result: the MacBook Pro M4 Pro / 24 GB unified-memory smoke
-reached about **3.17 tok/s reported rolling token latency** and **3.11 tok/s p50
-token latency** with `kv-cache` / `ort-direct`, a little over 5x the original
-steady token rate. The honest remaining work is cold load and TTFT: the
-measured cached run still took about **528.7s to Ready** and about **43.1s to
-first token**.
+reached about **3.60 tok/s reported rolling token latency** and **3.58 tok/s p50
+token latency** with `kv-cache` / `ort-direct` after the default warmup, about
+6x the original steady token rate. The honest remaining work is cold load. A
+fetch-concurrency sweep found `fetches=4` was the best stable default on this
+machine: without warmup that run measured about **530.6s to Ready** and
+**17.4s TTFT**. With the tiny cached-graph warmup enabled by default, the same
+path measured about **472.4s to Ready** and **1.1s TTFT** in the latest run.
+The additive `model_kv_cold64_q4f16.onnx` candidate improved the no-warmup Ready
+time to about **484.2s** with about **19.0s TTFT**, but that is only a modest
+partial win, so it remains an opt-in candidate rather than replacing the
+default. A later static-compatible compression experiment added gzip companions
+for the fast q4f16 external-data chunks. That reduced transfer from about
+12.97 GB to **8.85 GB**. The best compressed cold-start run used
+`compressed=1`, `warmup=0`, and `fetches=8`, and measured **316.6s Ready**,
+**17.3s TTFT**, and **3.61 tok/s**. That improves cold load materially, but it
+still misses the 2x cold-start target, so it is documented as opt-in.
 
 ## Why This Exists
 
@@ -109,10 +126,16 @@ https://scasella.github.io/talkie-quant-webgpu/
 ```
 
 The demo defaults to cached q4f16. On the validated MacBook Pro M4 Pro / 24 GB
-Chrome smoke, the fast cached q4f16 artifact loaded in about 8.8 minutes,
-reached first token in about 43 seconds after sending the prompt, and then
-reported about 3.17 tok/s rolling token latency. The smaller full-sequence
+Chrome smoke, the fast cached q4f16 artifact loaded in about 7.9 minutes,
+reached first token in about 1 second after sending the prompt, and then
+reported about 3.60 tok/s rolling token latency. The smaller full-sequence
 q4f16 fallback is still available in the model-path selector.
+
+For the best measured cold-start tradeoff, use the compressed opt-in URL:
+
+```text
+https://scasella.github.io/talkie-quant-webgpu/?compressed=1&warmup=0&fetches=8
+```
 
 Run locally:
 
@@ -143,6 +166,8 @@ validated ONNX artifacts.
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |
 | `onnx/model_kv_fast_q4f16.onnx` | hybrid q4f16 | Default direct ORT cached browser path, about 13.0&nbsp;GB | 55 |
+| `onnx/model_kv_fast_q4f16.onnx_data*.gz` | gzip external data | Opt-in compressed transfer for the default graph, about 8.85&nbsp;GB | 55 |
+| `onnx/model_kv_cold64_q4f16.onnx` | hybrid q4f16 | Opt-in cold-start candidate, about 12.25&nbsp;GB | 54 |
 | `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Conservative cached fallback, 16.53&nbsp;GB | 32 |
 | `onnx/model_kv_quantized.onnx` | hybrid q8 | Cached fallback path, 21.60&nbsp;GB | 42 |
 | `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Full-sequence fallback, 10.58&nbsp;GB | 22 |
@@ -179,9 +204,25 @@ http://127.0.0.1:5173/?path=full&dtype=q4f16&cache=0
 full-sequence artifact, and `cache=0` disables Transformers.js browser cache
 writes. Cache writes are off by default because these multi-GB external data
 files can create extra large browser-side allocations before WebGPU session
-creation. The direct ORT path also limits concurrent Hugging Face model fetches;
-override with `?fetches=8` or `VITE_TALKIE_FETCH_CONCURRENCY=8` when comparing
-network behavior.
+creation. The direct ORT path also limits concurrent Hugging Face model fetches.
+The latest M4 Pro sweep selected `4` as the raw default and `8` for compressed
+external-data opt-in; override with `?fetches=6` or
+`VITE_TALKIE_FETCH_CONCURRENCY=6` when comparing network behavior.
+The app also warms a tiny cached decode path after session creation so the first
+visible reply token arrives faster; opt out with `?warmup=0` or
+`VITE_TALKIE_DIRECT_WARMUP=0` when benchmarking raw TTFT.
+
+Opt into gzip-compressed external data for the best measured cold-start tradeoff:
+
+```text
+http://127.0.0.1:5173/?compressed=1&warmup=0&fetches=8
+```
+
+Opt into the smaller cold-start candidate without changing the default:
+
+```text
+http://127.0.0.1:5173/?revision=main&q4file=model_kv_cold64_q4f16.onnx&fetches=4
+```
 
 The app also defaults ONNX Runtime graph optimization to `disabled` for browser
 loads. A Playwright direct-ORT probe reached `Ready` on the full q4f16 artifact
@@ -256,7 +297,7 @@ npm run diagnose:browser
 Direct ONNX Runtime loader comparison:
 
 ```bash
-TALKIE_WEB_URL='http://127.0.0.1:5173/?fetches=6' \
+TALKIE_WEB_URL='http://127.0.0.1:5173/?fetches=4' \
 TALKIE_ORT_FILE=model_kv_fast_q4f16.onnx \
 TALKIE_ORT_CHUNKS=55 \
 TALKIE_ORT_OPT=disabled \
@@ -266,11 +307,21 @@ npm run diagnose:ort
 Repeatable latency benchmark:
 
 ```bash
-TALKIE_WEB_URL='http://127.0.0.1:5173/?fetches=6' \
+TALKIE_WEB_URL='http://127.0.0.1:5173/?fetches=4' \
 TALKIE_BENCH_TARGETS=cached-q4f16 \
 TALKIE_BENCH_RUNS=1 \
 TALKIE_WEB_MIN_TOKENS=16 \
 npm run benchmark:browser
+```
+
+Fetch-concurrency sweep:
+
+```bash
+TALKIE_WEB_URL=http://127.0.0.1:5173/ \
+TALKIE_FETCH_MATRIX=2,4,6,8,12 \
+TALKIE_BENCH_TARGETS=cached-q4f16 \
+TALKIE_BENCH_RUNS=1 \
+npm run benchmark:fetch-matrix
 ```
 
 Export validation for the cached artifacts requires top-token agreement against
@@ -284,16 +335,26 @@ Current browser result on a MacBook Pro with M4 Pro and 24 GB unified memory
 using Chrome/WebGPU:
 
 - Cached q4f16 direct ORT reached `Ready` in Chromium with `cache=0`,
-  `opt=disabled`, and `fetches=6`.
+  `opt=disabled`, `fetches=4`, and the default warmup enabled.
 - The same run generated 16 non-NUL words from a fixed prompt with `kv-cache`
-  / `ort-direct`, no NUL tokens, about `3.17 tok/s` reported rolling latency,
-  and about `3.11 tok/s` p50 token latency.
-- Cold load remained large: about `528.7s` to `Ready` and about `43.1s` TTFT
-  on the measured run.
+  / `ort-direct`, no NUL tokens, about `3.60 tok/s` reported rolling latency,
+  and about `3.58 tok/s` p50 token latency.
+- Cold load remained large: about `472.4s` to `Ready`, but TTFT fell to about
+  `1.1s` after warmup. The best no-warmup fetch-concurrency run was about
+  `530.6s` Ready / `17.4s` TTFT / `3.69 tok/s`.
+- The additive `model_kv_cold64_q4f16.onnx` candidate validated and loaded, but
+  only improved the same smoke to about `484.2s` Ready / `19.0s` TTFT, so it is
+  documented as opt-in rather than default.
+- The gzip external-data opt-in for `model_kv_fast_q4f16.onnx` validated in the
+  browser at `316.6s` Ready / `17.3s` TTFT / `3.61 tok/s` with `compressed=1`,
+  `warmup=0`, `fetches=8`, `cache=0`, and `opt=disabled`. It improves cold load
+  by about 40% versus the original `528.7s` Ready baseline, but it still misses
+  the `<=265s` Ready target, so it is not the default.
 - Full-sequence q4f16 remains available as the smaller fallback; the earlier
   smoke generated 16 non-NUL words at about `0.61 tok/s`.
 - Direct ORT and app loads with default graph optimization failed during session
-  creation with `std::bad_alloc`; `opt=disabled` is the browser-safe default.
+  creation with `std::bad_alloc`; a `basic` optimization probe failed the same
+  way. `opt=disabled` is the browser-safe default.
 
 ## Known Limits
 
@@ -313,6 +374,8 @@ using Chrome/WebGPU:
 - The first several cached tokens can still be slow while WebGPU compiles and
   warms shapes. The displayed tok/sec is a rolling token-latency rate, not a
   cold-start average.
+- The compressed opt-in reduces network transfer, but the browser still
+  materializes decompressed ONNX external data for WebGPU session creation.
 - The older full-sequence artifacts remain slower fallbacks.
 - If Chrome logs 404s for generic filenames such as `onnx/model.onnx`,
   `onnx/model_uint8.onnx`, or `onnx/model_q4.onnx`, the browser is running an

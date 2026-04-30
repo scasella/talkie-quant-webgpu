@@ -51,6 +51,12 @@ def main() -> None:
     parser.add_argument("--require-kv", action="store_true", help="Require the cached model_kv q4/q8 artifacts")
     parser.add_argument("--require-fast-kv-q4", action="store_true", help="Require additive model_kv_fast q4f16 artifact")
     parser.add_argument("--require-fast-kv", action="store_true", help="Require additive model_kv_fast q4/q8 artifacts")
+    parser.add_argument(
+        "--expect-model",
+        action="append",
+        default=[],
+        help="Also require a specific ONNX filename and its configured external-data chunks, e.g. model_kv_cold64_q4f16.onnx",
+    )
     args = parser.parse_args()
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -67,8 +73,15 @@ def main() -> None:
     elif args.require_fast_kv_q4:
         expected |= EXPECTED_FAST_KV_Q4
         expected_external_models.extend(EXPECTED_FAST_KV_Q4_EXTERNAL_MODELS)
+    for model_name in args.expect_model:
+        if "/" in model_name or not model_name.endswith(".onnx"):
+            print(f"--expect-model must be a bare .onnx filename, got: {model_name}")
+            sys.exit(1)
+        expected.add(f"onnx/{model_name}")
+        expected_external_models.append(model_name)
     missing = sorted(expected - files)
-    external_data = sorted(path for path in files if path.startswith("onnx/") and ".onnx_data" in path)
+    external_data = sorted(path for path in files if path.startswith("onnx/") and ".onnx_data" in path and not path.endswith(".gz"))
+    compressed_external_data = sorted(path for path in files if path.startswith("onnx/") and ".onnx_data" in path and path.endswith(".gz"))
 
     if missing:
         print("Missing expected files:")
@@ -131,6 +144,8 @@ def main() -> None:
         print("External data files:")
         for path in external_data:
             print(f"  - {path}")
+    if compressed_external_data:
+        print(f"Compressed external data files: {len(compressed_external_data)}")
     print("Hub artifact check passed.")
 
 

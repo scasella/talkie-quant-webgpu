@@ -33,28 +33,24 @@ base_model: lewtun/talkie-1930-13b-it-hf
 # Talkie 1930 13B IT ONNX WebGPU
 
 Unofficial community q4f16/q8 ONNX + WebGPU quantization of
-[`lewtun/talkie-1930-13b-it-hf`](https://huggingface.co/lewtun/talkie-1930-13b-it-hf)
-for browser inference with Transformers.js tokenizer/chat-template handling and
-direct ONNX Runtime WebGPU cached decoding.
+[`lewtun/talkie-1930-13b-it-hf`](https://huggingface.co/lewtun/talkie-1930-13b-it-hf) for browser inference
+with Transformers.js tokenizer/chat-template handling and direct ONNX Runtime
+WebGPU cached decoding.
 
 - Live browser demo: <https://scasella.github.io/talkie-quant-webgpu/>
 - GitHub runner and export scripts: <https://github.com/scasella/talkie-quant-webgpu>
 - Source model revision: `6311dedf518470856a8503f2080bb4b54fcb3323`
-- Validated ONNX artifact commit: `631cbea56319f30469aae41af8fbd3078c460b3b`
 - Default browser dtype: `q4f16`
 - Fallback dtype: `q8`
 - Stop token IDs: `[65535, 65536]`
-- Best measured browser speed: `3.17 tok/s` reported rolling token latency on
+- Best measured browser speed: `3.60 tok/s` reported rolling token latency on
   a MacBook Pro with M4 Pro and 24 GB unified memory
 
 This model keeps the source tokenizer, chat template, generation config, and
 Apache-2.0 license metadata. It is not an official Talkie release. The ONNX
-artifacts validate outside the browser. The default fast cached q4f16 path has
-also passed a Chrome/WebGPU smoke on a MacBook Pro with M4 Pro and 24 GB unified
+artifacts validate outside the browser. The fast cached q4f16 path has also
+passed a Chrome/WebGPU smoke on a MacBook Pro with M4 Pro and 24 GB unified
 memory using direct ONNX Runtime WebGPU.
-
-Later model-card-only commits may move this repo's HEAD without changing the
-validated ONNX artifacts.
 
 ## Badges And Discovery
 
@@ -69,8 +65,8 @@ what this repo actually ships:
 - **Task:** `text-generation`, because the artifact is a decoder-only chat/text
   generation model even though the app uses a custom manual loop instead of
   stock `pipeline("text-generation")`.
-- **Base model:** `lewtun/talkie-1930-13b-it-hf`, so Hugging Face links and
-  filters this as a quantized derivative of the source model.
+- **Base model:** `lewtun/talkie-1930-13b-it-hf`, so Hugging Face links and filters this as a
+  quantized derivative of the source model.
 - **Discovery tags:** `webgpu`, `onnx`, `onnxruntime-web`, `kv-cache`,
   `browser-ai`, `client-side-inference`, `edge-ai`, `apple-silicon`, `macos`,
   `q4f16`, and `q8`.
@@ -87,6 +83,8 @@ generated token.
 | --- | ---: | ---: | --- |
 | BF16 source safetensors | 26.56&nbsp;GB | baseline | `lewtun/talkie-1930-13b-it-hf` |
 | Fast cached q4f16 ONNX default | 13.0&nbsp;GB | 51% smaller | Direct ORT KV-cache browser path; q/k quantized, value unquantized |
+| Fast cached q4f16 gzip opt-in | 8.85&nbsp;GB transfer | 67% smaller transfer | Same ONNX graph with gzip-compressed external-data companions; best measured cold-start path, not default |
+| Cold64 cached q4f16 opt-in | 12.25&nbsp;GB | 54% smaller | Same validation profile as fast q4; smaller download, not default because it did not hit the 2x cold-start target |
 | Cached q4f16 ONNX fallback | 16.53&nbsp;GB | 38% smaller | KV-cache fallback; q/k/v projections unquantized |
 | Cached q8 ONNX fallback | 21.60&nbsp;GB | 19% smaller | KV-cache fallback; K/V projections unquantized |
 | Full-sequence q4f16 fallback | 10.58&nbsp;GB | 60% smaller | Smaller download, slower generation |
@@ -128,16 +126,30 @@ value projection unquantized. That preserved top-1 agreement on the smoke prompt
 and produced the default `onnx/model_kv_fast_q4f16.onnx`.
 
 Current browser smoke result: `kv-cache` / `ort-direct` generated 16 non-NUL
-words at about `3.17 tok/s` reported rolling token latency and `3.11 tok/s` p50
-token latency, over 5x the original full-sequence steady token rate. Cold load
-is still the big caveat: about `528.7s` to `Ready` and about `43.1s` TTFT in
-the measured run.
+words at about `3.60 tok/s` reported rolling token latency and `3.58 tok/s` p50
+token latency after the default warmup, about 6x the original full-sequence
+steady token rate. Cold load is still the big caveat. A fetch-concurrency sweep
+found `fetches=4` was the best stable default on this machine: without warmup,
+that run measured about `530.6s` to `Ready` and `17.4s` TTFT. With the tiny
+cached-graph warmup enabled by default, the same path measured about `472.4s`
+to `Ready` and `1.1s` TTFT in the latest run. The additive
+`model_kv_cold64_q4f16.onnx` candidate improved the no-warmup Ready time to
+about `484.2s` with about `19.0s` TTFT, but that is only a modest partial win,
+so it remains an opt-in candidate rather than replacing the default. A later
+static-compatible compression experiment added gzip companions for the fast
+q4f16 external-data chunks. That reduced transfer from about `12.97 GB` to
+`8.85 GB`. The best compressed cold-start run used `compressed=1`, `warmup=0`,
+and `fetches=8`, and measured about `316.6s` Ready, `17.3s` TTFT, and
+`3.61 tok/s`. That improves cold load materially, but it still misses the 2x
+cold-start target, so it is documented as opt-in.
 
 ## Files
 
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |
 | `onnx/model_kv_fast_q4f16.onnx` | hybrid q4f16 | Default direct ORT cached browser path, about 13.0&nbsp;GB | 55 |
+| `onnx/model_kv_fast_q4f16.onnx_data*.gz` | gzip external data | Opt-in compressed transfer for the default graph, about 8.85&nbsp;GB | 55 |
+| `onnx/model_kv_cold64_q4f16.onnx` | hybrid q4f16 | Opt-in cold-start candidate, about 12.25&nbsp;GB | 54 |
 | `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Conservative cached fallback, 16.53&nbsp;GB | 32 |
 | `onnx/model_kv_quantized.onnx` | hybrid q8 | Cached fallback path, 21.60&nbsp;GB | 42 |
 | `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Full-sequence fallback, 10.58&nbsp;GB | 22 |
@@ -165,6 +177,22 @@ npm run dev
 
 The app defaults to cached q4f16. The smaller full-sequence q4f16 artifact
 remains available as a fallback.
+
+The app also warms a tiny cached decode path after session creation so the first
+visible reply token arrives faster. Opt out with `?warmup=0` when benchmarking
+raw TTFT.
+
+Opt into gzip-compressed external data for the best measured cold-start tradeoff:
+
+```text
+https://scasella.github.io/talkie-quant-webgpu/?compressed=1&warmup=0&fetches=8
+```
+
+Opt into the smaller cold-start candidate without changing the default:
+
+```text
+https://scasella.github.io/talkie-quant-webgpu/?revision=main&q4file=model_kv_cold64_q4f16.onnx&fetches=4
+```
 
 ## Transformers.js Notes
 
@@ -195,31 +223,25 @@ ONNX Runtime loading, limited concurrent model fetches, and manual
 - Hub artifact validation confirms tokenizer/config files, ONNX files, and all
   q4/q8 external-data chunks, including the additive fast cached q4 artifact.
 - The additive fast cached q4f16 artifact validated top-1 against the PyTorch
-  full-sequence wrapper with value projection left unquantized. The all-projection
-  fast q4 attempt failed top-5 validation and was not made the default.
+  full-sequence wrapper with value projection left unquantized.
 - The cached q8 fallback validated against the same reference on the CPU
   provider and is kept as a browser/WebGPU fallback.
 - Chrome on a MacBook Pro with M4 Pro and 24 GB unified memory loaded cached
-  q4f16 with `cache=0`, `opt=disabled`, and `fetches=6`, then generated 16
-  non-NUL words with
-  `kv-cache` / `ort-direct`, about `3.17 tok/s` reported rolling latency, and
-  about `3.11 tok/s` p50 token latency.
-- Cold load remains slow: the measured run took about `528.7s` to `Ready` and
-  about `43.1s` TTFT.
-- Direct ORT and app loads with default graph optimization failed with
-  `std::bad_alloc`; `opt=disabled` is the browser-safe default.
-
-Re-run the public artifact check:
-
-```bash
-python3 scripts/check_hub_artifacts.py scasella91/talkie-1930-13b-it-ONNX
-```
-
-Require the cached KV artifacts after republishing:
-
-```bash
-python3 scripts/check_hub_artifacts.py --require-kv --require-fast-kv-q4 scasella91/talkie-1930-13b-it-ONNX
-```
+  q4f16 with `cache=0`, `opt=disabled`, `fetches=4`, and the default warmup,
+  then generated 16 non-NUL words with
+  `kv-cache` / `ort-direct`, about `3.60 tok/s` reported rolling latency, and
+  about `3.58 tok/s` p50 token latency.
+- Cold load remains slow: the default warmup run took about `472.4s` to
+  `Ready`, but TTFT fell to about `1.1s`. The best no-warmup fetch-concurrency
+  run was about `530.6s` Ready / `17.4s` TTFT / `3.69 tok/s`.
+- The additive `model_kv_cold64_q4f16.onnx` candidate validated and loaded, but
+  only improved the same smoke to about `484.2s` Ready / `19.0s` TTFT, so it is
+  documented as opt-in rather than default.
+- The gzip external-data opt-in for `model_kv_fast_q4f16.onnx` validated in the
+  browser at `316.6s` Ready / `17.3s` TTFT / `3.61 tok/s` with `compressed=1`,
+  `warmup=0`, `fetches=8`, `cache=0`, and `opt=disabled`. It improves cold load
+  by about 40% versus the original `528.7s` Ready baseline, but it still misses
+  the `<=265s` Ready target, so it is not the default.
 
 ## Known Limitations
 
@@ -233,17 +255,13 @@ python3 scripts/check_hub_artifacts.py --require-kv --require-fast-kv-q4 scasell
   latency are still slow.
 - The displayed tok/sec is a rolling token-latency rate, not a cold-start
   average.
+- The compressed opt-in reduces network transfer, but the browser still
+  materializes decompressed ONNX external data for WebGPU session creation.
 - The older full-sequence artifacts remain slower fallbacks.
-- This repo is public and assumes unauthenticated browser loading. Do not embed
-  private Hugging Face tokens in browser code.
 
 ## Attribution
 
 Talkie was developed by Alec Radford, Nick Levine, and David Duvenaud. This ONNX
 repo builds on the Hugging Face Transformers-format conversion by
-[`lewtun/talkie-1930-13b-it-hf`](https://huggingface.co/lewtun/talkie-1930-13b-it-hf)
-and the original Talkie project at <https://github.com/talkie-lm/talkie>.
-
-## License
-
-Apache-2.0, matching the source model metadata.
+[`lewtun/talkie-1930-13b-it-hf`](https://huggingface.co/lewtun/talkie-1930-13b-it-hf) and the original
+Talkie project at <https://github.com/talkie-lm/talkie>.

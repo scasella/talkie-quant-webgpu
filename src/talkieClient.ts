@@ -8,7 +8,7 @@ import {
 } from "@huggingface/transformers";
 import * as ort from "onnxruntime-web/webgpu";
 import { waitForTalkieFetchRetry } from "./fetchRetry";
-import { installTalkieFetchLimiter, setTalkieFetchProgressListener } from "./fetchLimiter";
+import { installTalkieFetchLimiter, setTalkieFetchProgressListener, talkieFetchConcurrency } from "./fetchLimiter";
 
 export type Role = "system" | "user" | "assistant";
 
@@ -65,11 +65,15 @@ const MODEL_ID = RUNTIME_PARAMS.get("model") || import.meta.env.VITE_TALKIE_ONNX
 const REVISION = RUNTIME_PARAMS.get("revision") || import.meta.env.VITE_TALKIE_ONNX_REVISION || DEFAULT_REVISION;
 const DTYPE_OVERRIDE = RUNTIME_PARAMS.get("dtype") || import.meta.env.VITE_TALKIE_ONNX_DTYPE;
 const LOAD_PATH_OVERRIDE = RUNTIME_PARAMS.get("path");
+const CACHED_Q4_FILE_OVERRIDE = RUNTIME_PARAMS.get("q4file") || import.meta.env.VITE_TALKIE_CACHED_Q4_FILE;
+const CACHED_Q8_FILE_OVERRIDE = RUNTIME_PARAMS.get("q8file") || import.meta.env.VITE_TALKIE_CACHED_Q8_FILE;
 const CACHE_OVERRIDE = RUNTIME_PARAMS.get("cache");
 const GRAPH_OPTIMIZATION_LEVEL =
   RUNTIME_PARAMS.get("opt") || import.meta.env.VITE_TALKIE_GRAPH_OPTIMIZATION || "disabled";
 const DIRECT_CACHED_ENABLED =
   RUNTIME_PARAMS.get("direct") !== "0" && import.meta.env.VITE_TALKIE_DIRECT_CACHED !== "0";
+const WARMUP_OVERRIDE = RUNTIME_PARAMS.get("warmup") ?? import.meta.env.VITE_TALKIE_DIRECT_WARMUP;
+const DIRECT_WARMUP_ENABLED = WARMUP_OVERRIDE !== "0";
 const BROWSER_CACHE_ENABLED =
   CACHE_OVERRIDE === "1" || (CACHE_OVERRIDE !== "0" && import.meta.env.VITE_TALKIE_BROWSER_CACHE === "1");
 const DEFAULT_LOAD_PATH: LoadPath =
@@ -142,6 +146,16 @@ export async function loadTalkieRuntime(onProgress?: ProgressCallback, loadPath?
   runtimePath = requestedPath;
 
   runtimePromise = (async () => {
+    recordLoadMetric("runtime-start", {
+      loadPath: requestedPath,
+      modelId: MODEL_ID,
+      revision: REVISION,
+      graphOptimizationLevel: GRAPH_OPTIMIZATION_LEVEL,
+      directCached: DIRECT_CACHED_ENABLED,
+      warmup: DIRECT_WARMUP_ENABLED,
+      browserCache: BROWSER_CACHE_ENABLED,
+      fetchConcurrency: talkieFetchConcurrency()
+    });
     if (!hasWebGPU()) {
       throw new Error("WebGPU is not available in this browser.");
     }
@@ -154,30 +168,37 @@ export async function loadTalkieRuntime(onProgress?: ProgressCallback, loadPath?
       onProgress?.(event);
     };
 
+    recordLoadMetric("config-start", {});
     const config = await AutoConfig.from_pretrained(MODEL_ID, {
       revision: REVISION,
       progress_callback
     } as any);
+    recordLoadMetric("config-end", {});
     const dtypes = getAvailableDtypes(config);
     const explicitDtype = DTYPE_OVERRIDE && DTYPE_OVERRIDE !== "auto" ? DTYPE_OVERRIDE : null;
     const hasExplicitDtype = explicitDtype != null;
     const preferred = explicitDtype ? [explicitDtype] : ["q4f16", "q4", "q8", "fp16", "fp32"];
     const dtype = preferred.find((candidate) => dtypes.includes(candidate)) ?? "q4f16";
 
+    recordLoadMetric("tokenizer-start", {});
     const tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, {
       revision: REVISION,
       progress_callback
     } as any);
+    recordLoadMetric("tokenizer-end", {});
 
     const attempts = buildLoadAttempts(preferred, dtypes, requestedPath, !hasExplicitDtype, config);
     let loaded: LoadedModel | null = null;
     let lastError: unknown = null;
     for (const attempt of attempts) {
       try {
+        recordLoadMetric("model-attempt-start", { ...attempt });
         loaded = await loadModelAttempt(config, progress_callback, attempt);
+        recordLoadMetric("model-attempt-end", { ...attempt });
         break;
       } catch (error) {
         lastError = error;
+        recordLoadMetric("model-attempt-error", { ...attempt, error: errorMessage(error) });
         const detail = `${attempt.dtype} ${attempt.mode} load failed: ${errorMessage(error)}`;
         console.warn(`[talkie] ${detail}`);
         progress_callback({ status: detail });
@@ -820,7 +841,9 @@ async function loadDirectOrtModel(
 ): Promise<DirectOrtModel> {
   if (!attempt.onnxFileName) throw new Error("Direct cached load requires an ONNX filename.");
   progress_callback({ status: `Loading direct ${attempt.dtype} kv-cache` });
+  recordLoadMetric("fetch-retry-wait-start", { onnxFileName: attempt.onnxFileName });
   await waitForTalkieFetchRetry();
+  recordLoadMetric("fetch-retry-wait-end", { onnxFileName: attempt.onnxFileName });
 
   setTalkieFetchProgressListener((event) => {
     progress_callback({
@@ -833,12 +856,17 @@ async function loadDirectOrtModel(
 
   let session: ort.InferenceSession | null = null;
   try {
+    recordLoadMetric("onnx-session-create-start", {
+      onnxFileName: attempt.onnxFileName,
+      externalDataFiles: externalDataForModel(attempt.onnxFileName, config).length
+    });
     session = await ort.InferenceSession.create(hubOnnxUrl(attempt.onnxFileName), {
       executionProviders: ["webgpu"],
       externalData: externalDataForModel(attempt.onnxFileName, config),
       graphOptimizationLevel: GRAPH_OPTIMIZATION_LEVEL as ort.InferenceSession.SessionOptions["graphOptimizationLevel"],
       preferredOutputLocation: directPreferredOutputLocation(config)
     });
+    recordLoadMetric("onnx-session-create-end", { onnxFileName: attempt.onnxFileName });
   } finally {
     setTalkieFetchProgressListener(null);
   }
@@ -850,7 +878,7 @@ async function loadDirectOrtModel(
     throw new Error("Direct cached ONNX session does not expose past/present KV tensors.");
   }
 
-  return {
+  const model: DirectOrtModel = {
     kind: "direct-ort-kv",
     session,
     config,
@@ -864,6 +892,51 @@ async function loadDirectOrtModel(
       await session.release();
     }
   };
+
+  if (DIRECT_WARMUP_ENABLED) {
+    await warmupDirectOrtModel(model, progress_callback);
+  }
+
+  return model;
+}
+
+async function warmupDirectOrtModel(model: DirectOrtModel, progress_callback: ProgressCallback): Promise<void> {
+  progress_callback({ status: "Warming cached runtime" });
+  recordLoadMetric("warmup-start", { modelFileName: model.modelFileName });
+
+  let cache = createEmptyDirectKvCache(model);
+  let prefillOutputs: Record<string, ort.Tensor> | null = null;
+  let decodeOutputs: Record<string, ort.Tensor> | null = null;
+  try {
+    prefillOutputs = await model.session.run(
+      {
+        input_ids: idsToOrtTensor([1, 2, 3, 4]),
+        position_ids: positionIdsToOrtTensor(0, 4),
+        ...cache
+      },
+      directKvFetches(model)
+    );
+    cache = updateDirectKvCache(cache, prefillOutputs);
+    disposeOrtOutputsExceptCache(prefillOutputs, cache);
+
+    decodeOutputs = await model.session.run(
+      {
+        input_ids: idsToOrtTensor([5]),
+        position_ids: positionIdsToOrtTensor(4, 1),
+        ...cache
+      },
+      directKvFetches(model)
+    );
+    const nextCache = updateDirectKvCache(cache, decodeOutputs);
+    disposeOrtOutputsExceptCache(decodeOutputs, nextCache);
+    cache = nextCache;
+    recordLoadMetric("warmup-end", { modelFileName: model.modelFileName });
+  } catch (error) {
+    recordLoadMetric("warmup-error", { modelFileName: model.modelFileName, error: errorMessage(error) });
+    console.warn(`[talkie] Direct warmup failed: ${errorMessage(error)}`);
+  } finally {
+    disposeDirectKvCache(cache);
+  }
 }
 
 function directPreferredOutputLocation(config: any): ort.InferenceSession.SessionOptions["preferredOutputLocation"] {
@@ -913,6 +986,13 @@ function disposeDirectKvCache(cache: Record<string, ort.Tensor>): void {
   for (const tensor of Object.values(cache)) tensor.dispose();
 }
 
+function disposeOrtOutputsExceptCache(outputs: Record<string, ort.Tensor>, cache: Record<string, ort.Tensor>): void {
+  const retained = new Set(Object.values(cache));
+  for (const tensor of Object.values(outputs)) {
+    if (!retained.has(tensor)) tensor.dispose();
+  }
+}
+
 function directKvFetches(model: DirectOrtModel): Record<string, null> {
   return Object.fromEntries(["logits", ...model.cacheOutputNames].map((name) => [name, null]));
 }
@@ -936,8 +1016,12 @@ function zerosForOrtTensorType(type: ort.Tensor.Type, size: number): Float32Arra
 
 function directCachedCandidates(dtype: string, config: any): string[] {
   const standard = cachedOnnxFileName(dtype);
+  const override = dtype === "q8" ? CACHED_Q8_FILE_OVERRIDE : CACHED_Q4_FILE_OVERRIDE;
   const fast = dtype === "q8" ? "model_kv_fast_quantized.onnx" : "model_kv_fast_q4f16.onnx";
-  return hasExternalDataEntry(config, fast) ? [fast, standard] : [standard];
+  const candidates = [override, fast, standard].filter((value): value is string => Boolean(value));
+  return candidates
+    .filter((candidate, index, array) => array.indexOf(candidate) === index)
+    .filter((candidate) => hasExternalDataEntry(config, candidate));
 }
 
 function cachedOnnxFileName(dtype: string): string {
@@ -978,4 +1062,17 @@ function recordGenerationStats(stats: GenerationStats): void {
   };
   target.__talkieMetrics ??= { generation: [] };
   target.__talkieMetrics.generation.push({ ...stats, timeMs: performance.now() });
+}
+
+function recordLoadMetric(kind: string, detail: Record<string, unknown>): void {
+  if (typeof window === "undefined") return;
+  const target = window as Window & {
+    __talkieMetrics?: {
+      load?: Array<Record<string, unknown>>;
+      generation?: Array<GenerationStats & { timeMs?: number }>;
+    };
+  };
+  target.__talkieMetrics ??= { generation: [] };
+  target.__talkieMetrics.load ??= [];
+  target.__talkieMetrics.load.push({ kind, timeMs: performance.now(), ...detail });
 }

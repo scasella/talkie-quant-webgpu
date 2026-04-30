@@ -21,6 +21,12 @@ const targetTokSec = Number(process.env.TALKIE_BENCH_TARGET_TOK_SEC ?? "1.8");
 const cache = process.env.TALKIE_BROWSER_CACHE ?? "0";
 const opt = process.env.TALKIE_GRAPH_OPTIMIZATION ?? "disabled";
 const direct = process.env.TALKIE_DIRECT_CACHED ?? "1";
+const warmup = process.env.TALKIE_DIRECT_WARMUP ?? "1";
+const fetches = process.env.TALKIE_FETCH_CONCURRENCY ?? "";
+const q4file = process.env.TALKIE_CACHED_Q4_FILE ?? "";
+const q8file = process.env.TALKIE_CACHED_Q8_FILE ?? "";
+const revision = process.env.TALKIE_ONNX_REVISION ?? "";
+const compressed = process.env.TALKIE_COMPRESSED_EXTERNAL_DATA ?? "";
 const headed = process.env.TALKIE_HEADLESS !== "1";
 const outDir = process.env.TALKIE_BENCH_OUT_DIR ?? "output/playwright";
 const prompt =
@@ -49,7 +55,11 @@ try {
           result.ttftMs
         )} reported=${formatNumber(result.reportedTokSec)} tok/s p50=${formatNumber(
           result.p50TokSec
-        )} p90=${formatNumber(result.p90TokSec)}`
+        )} p90=${formatNumber(result.p90TokSec)} download=${formatSeconds(
+          result.phaseSummary?.onnxNetworkMs
+        )} session=${formatSeconds(result.phaseSummary?.onnxSessionCreateMs)} bytes=${formatBytes(
+          result.phaseSummary?.onnxFetchedBytes
+        )}`
       );
     }
   }
@@ -61,6 +71,15 @@ try {
     targets,
     runs,
     targetTokSec,
+    cache,
+    opt,
+    direct,
+    warmup,
+    fetches: fetches || "default",
+    q4file: q4file || "default",
+    q8file: q8file || "default",
+    revision: revision || "default",
+    compressed: compressed || "default",
     results,
     summary: summarize(results)
   };
@@ -75,6 +94,12 @@ function benchmarkUrl(config) {
   url.searchParams.set("cache", cache);
   url.searchParams.set("opt", opt);
   url.searchParams.set("direct", direct);
+  url.searchParams.set("warmup", warmup);
+  if (fetches) url.searchParams.set("fetches", fetches);
+  if (q4file) url.searchParams.set("q4file", q4file);
+  if (q8file) url.searchParams.set("q8file", q8file);
+  if (revision) url.searchParams.set("revision", revision);
+  if (compressed) url.searchParams.set("compressed", compressed);
   return url.toString();
 }
 
@@ -87,11 +112,35 @@ async function runTarget(browser, target, config, runIndex) {
   const started = performance.now();
   const samples = [];
   const consoleWarnings = [];
+  const network = { requests: [], responses: [] };
   page.on("console", (message) => {
     if (message.type() === "error" || message.type() === "warning") {
       consoleWarnings.push({ timeMs: performance.now() - started, type: message.type(), text: message.text() });
       console.log(`[browser:${message.type()}] ${message.text()}`);
     }
+  });
+  page.on("request", (request) => {
+    const requestUrl = request.url();
+    if (!isModelRequest(requestUrl)) return;
+    network.requests.push({
+      timeMs: performance.now() - started,
+      method: request.method(),
+      url: requestUrl,
+      file: modelFileName(requestUrl)
+    });
+  });
+  page.on("response", (response) => {
+    const responseUrl = response.url();
+    if (!isModelRequest(responseUrl)) return;
+    const headers = response.headers();
+    network.responses.push({
+      timeMs: performance.now() - started,
+      status: response.status(),
+      url: responseUrl,
+      file: modelFileName(responseUrl),
+      contentLength: numberHeader(headers["content-length"]),
+      contentRange: headers["content-range"] ?? null
+    });
   });
 
   try {
@@ -103,12 +152,16 @@ async function runTarget(browser, target, config, runIndex) {
     await page.getByRole("button", { name: "Load" }).click();
     const loadResult = await waitForLoad(page, cdp, started, samples);
     if (loadResult.status !== "Ready") {
+      const metrics = await readMetrics(page);
       return {
         target,
         runIndex,
         status: loadResult.status,
         error: loadResult.error ?? "load failed",
         loadMs: loadResult.timeMs,
+        phaseSummary: summarizePhases(metrics, network),
+        metrics,
+        network,
         samples,
         consoleWarnings
       };
@@ -125,6 +178,7 @@ async function runTarget(browser, target, config, runIndex) {
     const firstToken = generation[0]?.timeMs;
     const tokenLatencies = generation.map((item) => Number(item.lastTokenMs)).filter(Number.isFinite);
     const reportedTokSec = Number(generation.at(-1)?.tokensPerSecond ?? generationResult.tokenRate ?? 0) || null;
+    const phaseSummary = summarizePhases(metrics, network);
 
     return {
       target,
@@ -140,6 +194,9 @@ async function runTarget(browser, target, config, runIndex) {
       nulCount: generationResult.nulCount,
       mode: generation.at(-1)?.mode ?? null,
       backend: generation.at(-1)?.backend ?? null,
+      phaseSummary,
+      metrics,
+      network,
       tokenLatencies,
       samples,
       consoleWarnings
@@ -150,6 +207,7 @@ async function runTarget(browser, target, config, runIndex) {
       runIndex,
       status: "Error",
       error: error instanceof Error ? error.message : String(error),
+      network,
       samples,
       consoleWarnings
     };
@@ -201,7 +259,51 @@ async function collectSample(page, cdp, started) {
 }
 
 async function readMetrics(page) {
-  return await page.evaluate(() => window.__talkieMetrics ?? { events: [], generation: [] });
+  return await page.evaluate(() => window.__talkieMetrics ?? { events: [], load: [], generation: [] });
+}
+
+function summarizePhases(metrics, network) {
+  const events = metrics.events ?? [];
+  const load = metrics.load ?? [];
+  const generation = metrics.generation ?? [];
+  const event = (items, kind) => items.find((item) => item.kind === kind);
+  const duration = (items, startKind, endKind) => {
+    const start = event(items, startKind)?.timeMs;
+    const end = event(items, endKind)?.timeMs;
+    return typeof start === "number" && typeof end === "number" ? Math.max(0, end - start) : null;
+  };
+  const onnxRequests = network.requests.filter((item) => item.file?.includes(".onnx"));
+  const onnxResponses = network.responses.filter((item) => item.file?.includes(".onnx"));
+  const firstOnnxRequest = onnxRequests[0] ?? null;
+  const lastOnnxRequest = onnxRequests.at(-1) ?? null;
+  const firstOnnxResponse = onnxResponses[0] ?? null;
+  const lastOnnxResponse = onnxResponses.at(-1) ?? null;
+  const onnxFetchedBytes = onnxResponses.reduce((sum, item) => sum + (item.contentLength ?? 0), 0);
+  const onnxNetworkMs =
+    firstOnnxRequest && lastOnnxResponse ? Math.max(0, lastOnnxResponse.timeMs - firstOnnxRequest.timeMs) : null;
+  const onnxSessionCreateMs = duration(load, "onnx-session-create-start", "onnx-session-create-end");
+  const generationStart = event(events, "generation-start")?.timeMs;
+  const firstToken = generation[0]?.timeMs;
+  return {
+    appLoadMs: duration(events, "load-start", "load-ready"),
+    configMs: duration(load, "config-start", "config-end"),
+    tokenizerMs: duration(load, "tokenizer-start", "tokenizer-end"),
+    fetchRetryWaitMs: duration(load, "fetch-retry-wait-start", "fetch-retry-wait-end"),
+    onnxSessionCreateMs,
+    onnxNetworkMs,
+    estimatedSessionCompileMs:
+      onnxSessionCreateMs != null && onnxNetworkMs != null ? Math.max(0, onnxSessionCreateMs - onnxNetworkMs) : null,
+    warmupMs: duration(load, "warmup-start", "warmup-end"),
+    ttftMs:
+      typeof generationStart === "number" && typeof firstToken === "number" ? Math.max(0, firstToken - generationStart) : null,
+    onnxFetchedBytes,
+    firstOnnxRequest,
+    lastOnnxRequest,
+    firstOnnxResponse,
+    lastOnnxResponse,
+    requestCount: network.requests.length,
+    responseCount: network.responses.length
+  };
 }
 
 function readStatus(text) {
@@ -222,6 +324,21 @@ function percentile(values, p) {
 
 function latencyToTokSec(ms) {
   return ms && ms > 0 ? 1000 / ms : null;
+}
+
+function isModelRequest(url) {
+  return url.includes("huggingface.co") || url.includes("/onnx/") || url.includes("/resolve/");
+}
+
+function modelFileName(url) {
+  const clean = url.split(/[?#]/)[0];
+  const parts = clean.split("/");
+  return parts.at(-1) ?? url;
+}
+
+function numberHeader(value) {
+  const parsed = Number(value ?? "");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function summarize(items) {
@@ -256,4 +373,8 @@ function formatSeconds(ms) {
 
 function formatNumber(value) {
   return value == null || !Number.isFinite(value) ? "--" : Number(value).toFixed(2);
+}
+
+function formatBytes(value) {
+  return value == null || !Number.isFinite(value) ? "--" : `${(value / 1e9).toFixed(2)}GB`;
 }

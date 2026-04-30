@@ -6,6 +6,14 @@ const baseUrl = process.env.TALKIE_WEB_URL ?? "http://127.0.0.1:5173/";
 const loadPath = process.env.TALKIE_LOAD_PATH ?? "full";
 const dtype = process.env.TALKIE_DTYPE ?? "q4f16";
 const cache = process.env.TALKIE_BROWSER_CACHE ?? "0";
+const opt = process.env.TALKIE_GRAPH_OPTIMIZATION ?? "disabled";
+const direct = process.env.TALKIE_DIRECT_CACHED ?? "1";
+const warmup = process.env.TALKIE_DIRECT_WARMUP ?? "1";
+const fetches = process.env.TALKIE_FETCH_CONCURRENCY ?? "";
+const q4file = process.env.TALKIE_CACHED_Q4_FILE ?? "";
+const q8file = process.env.TALKIE_CACHED_Q8_FILE ?? "";
+const revision = process.env.TALKIE_ONNX_REVISION ?? "";
+const compressed = process.env.TALKIE_COMPRESSED_EXTERNAL_DATA ?? "";
 const timeoutMs = Number(process.env.TALKIE_DIAG_TIMEOUT_MS ?? `${20 * 60 * 1000}`);
 const pollMs = Number(process.env.TALKIE_DIAG_POLL_MS ?? "5000");
 const outDir = process.env.TALKIE_DIAG_OUT_DIR ?? "output/playwright";
@@ -20,6 +28,14 @@ const url = new URL(baseUrl);
 url.searchParams.set("path", loadPath);
 url.searchParams.set("dtype", dtype);
 url.searchParams.set("cache", cache);
+url.searchParams.set("opt", opt);
+url.searchParams.set("direct", direct);
+url.searchParams.set("warmup", warmup);
+if (fetches) url.searchParams.set("fetches", fetches);
+if (q4file) url.searchParams.set("q4file", q4file);
+if (q8file) url.searchParams.set("q8file", q8file);
+if (revision) url.searchParams.set("revision", revision);
+if (compressed) url.searchParams.set("compressed", compressed);
 
 const startedAt = new Date();
 const trace = {
@@ -28,6 +44,14 @@ const trace = {
   loadPath,
   dtype,
   cache,
+  opt,
+  direct,
+  warmup,
+  fetches: fetches || "default",
+  q4file: q4file || "default",
+  q8file: q8file || "default",
+  revision: revision || "default",
+  compressed: compressed || "default",
   timeoutMs,
   console: [],
   pageErrors: [],

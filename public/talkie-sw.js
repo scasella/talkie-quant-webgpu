@@ -1,8 +1,9 @@
 const RETRYABLE_HOST_PARTS = ["huggingface.co", "hf.co"];
 const MAX_ATTEMPTS = 4;
-const MAX_PARALLEL_MODEL_FETCHES = 12;
+const DEFAULT_MAX_PARALLEL_MODEL_FETCHES = 4;
 
 let activeModelFetches = 0;
+let maxParallelModelFetches = DEFAULT_MAX_PARALLEL_MODEL_FETCHES;
 const pendingModelFetches = [];
 
 self.addEventListener("install", (event) => {
@@ -16,6 +17,15 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   if (!shouldRetry(event.request)) return;
   event.respondWith(enqueueModelFetch(() => fetchWithRetry(event.request)));
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type !== "talkie-fetch-concurrency") return;
+  const configured = Number(event.data.maxParallelModelFetches);
+  if (Number.isFinite(configured) && configured >= 1) {
+    maxParallelModelFetches = Math.floor(configured);
+    pumpModelFetchQueue();
+  }
 });
 
 function shouldRetry(request) {
@@ -51,7 +61,7 @@ function enqueueModelFetch(task) {
 }
 
 function pumpModelFetchQueue() {
-  while (activeModelFetches < MAX_PARALLEL_MODEL_FETCHES && pendingModelFetches.length > 0) {
+  while (activeModelFetches < maxParallelModelFetches && pendingModelFetches.length > 0) {
     const item = pendingModelFetches.shift();
     activeModelFetches += 1;
     Promise.resolve()
