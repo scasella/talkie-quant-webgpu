@@ -24,7 +24,10 @@
     "quantization",
     "browser-ai",
     "llm",
-    "text-generation"
+    "text-generation",
+    "kv-cache",
+    "onnxruntime-web",
+    "historical"
   ],
   "scripts": {
     "dev": "vite --host 127.0.0.1",

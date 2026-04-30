@@ -7,7 +7,9 @@ Use this checklist before publishing or tagging the repo.
 - GitHub repo: `scasella/talkie-quant-webgpu`
 - Live demo: `https://scasella.github.io/talkie-quant-webgpu/`
 - Hub repo: `scasella91/talkie-1930-13b-it-ONNX`
+- Latest GitHub release target: `v0.2.0` fast cached WebGPU path
 - Validated ONNX artifact commit: `631cbea56319f30469aae41af8fbd3078c460b3b`
+- Latest HF model-card update: `f10c5bb2a011617597546ab9d96b9cf482112bce`
 - Browser default: `onnx/model_kv_fast_q4f16.onnx`
 - Fast cached q4 artifact: `onnx/model_kv_fast_q4f16.onnx`, `55` chunks,
   about `13.0 GB`
@@ -24,6 +26,10 @@ Use this checklist before publishing or tagging the repo.
   reported rolling latency, and about `3.11 tok/s` p50 token latency.
 - Full-sequence q4f16 fallback previously generated 16 non-NUL words at about
   `0.61 tok/s`.
+- Public docs should preserve the performance journey: full-sequence baseline,
+  KV-cache export, direct ORT runtime, graph-optimization failure,
+  fetch-limiting fix, failed all-projection q4 candidate, and the final
+  q/k-quantized value-unquantized fast q4 artifact.
 
 ## Required Checks
 

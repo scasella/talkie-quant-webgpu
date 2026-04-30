@@ -27,19 +27,24 @@ easier to try from a local browser with WebGPU.
 
 ## GitHub Release
 
-Talkie Quant WebGPU v0.1.0 publishes a community ONNX/WebGPU artifact path
-for Talkie 1930 13B:
+Talkie Quant WebGPU v0.2.0 updates the first browser-ready community
+ONNX/WebGPU path for Talkie 1930 13B with the fast cached q4f16 runtime.
 
-- fast cached q4f16 ONNX default for browser decoding, with 55 external-data
-  chunks and about 3.17 tok/s rolling token latency on the M4 Pro smoke
-- cached q4f16/q8 ONNX fallbacks, with 32 and 42 external-data chunks
-- full-sequence q4f16/q8 fallbacks with 22 and 31 external-data chunks
-- Static React/Vite WebGPU chat demo using Transformers.js
-- Manual Talkie generation loop, token `0` suppression, and stop IDs
-  `65535`/`65536`
-- Advanced Modal scripts for reproducing the export
+What changed:
+
+- moved the default browser path from full-sequence q4f16 to direct ONNX
+  Runtime WebGPU KV-cache decoding
+- improved steady decode from about 0.61 tok/s to about 3.17 tok/s reported
+  rolling token latency on the same 24 GB M4 Pro Chrome/WebGPU smoke
+- published `onnx/model_kv_fast_q4f16.onnx`, about 13 GB across 55 chunks, with
+  q/k attention projections quantized and value projections left unquantized
+- kept cached q4/q8 and full-sequence q4/q8 artifacts as fallbacks
+- documented the trial-and-error path: full-sequence baseline, browser
+  allocation failures, graph-optimization failures, fetch-throttling fix, and
+  the failed all-attention-projection q4 candidate
 
 Try the demo: https://scasella.github.io/talkie-quant-webgpu/
+Read the journey: https://github.com/scasella/talkie-quant-webgpu#performance-journey
 
 ## Discord Or Social
 

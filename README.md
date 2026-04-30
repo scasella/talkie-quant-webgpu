@@ -2,9 +2,11 @@
 
 Unofficial community q4f16/q8 ONNX + WebGPU release for
 [`lewtun/talkie-1930-13b-it-hf`](https://huggingface.co/lewtun/talkie-1930-13b-it-hf).
-This repo publishes browser-oriented ONNX artifacts and a static
-[Transformers.js](https://huggingface.co/docs/transformers.js/index) WebGPU
-loader for Talkie 1930 13B, with no backend and no browser-exposed credentials.
+This repo publishes browser-oriented ONNX artifacts and a static WebGPU runner
+for Talkie 1930 13B, using
+[Transformers.js](https://huggingface.co/docs/transformers.js/index) for
+tokenizer/chat-template handling and direct ONNX Runtime WebGPU for the default
+cached graph. There is no backend and no browser-exposed credential.
 The demo now defaults to a direct ONNX Runtime WebGPU KV-cache path. On a
 24 GB M4 Pro Chrome/WebGPU smoke, the additive fast cached q4f16 artifact
 generated 16 non-NUL words at about **3.17 tok/s reported rolling latency** /
@@ -35,6 +37,49 @@ avoids rerunning the full prompt every generated token.
 The q4f16 files are larger than a theoretical pure 4-bit checkpoint because
 ONNX stores scales, metadata, and unquantized tensors. The cached files trade
 first-load size for faster steady per-token decoding.
+
+## Performance Journey
+
+The first working browser release optimized for correctness and availability:
+export the custom Talkie architecture to ONNX, quantize the full-sequence graph,
+ship tokenizer/config/chat-template files beside it, and prove that Chrome
+could stream real non-NUL text. That path worked, but it had the expected
+latency problem: each generated token reran the entire accumulated prompt. The
+24 GB M4 Pro smoke measured about **0.61 tok/s** on the full-sequence q4f16
+artifact.
+
+The faster path came from treating the browser as the system of record, not just
+the export. The steps that mattered:
+
+1. Exported KV-cache ONNX graphs so generation could feed only the newest token
+   after prompt prefill.
+2. Kept a custom generation loop because Talkie is not a stock
+   Transformers.js causal-LM architecture.
+3. Moved cached execution to direct `onnxruntime-web/webgpu`, while still using
+   Transformers.js for tokenizer and chat-template handling.
+4. Fed `input_ids`, `position_ids`, and `past_key_values.*` manually; kept
+   `present.*` tensors on GPU where possible and copied only logits back to the
+   CPU sampler.
+5. Disabled ONNX Runtime graph optimization in the browser after default
+   optimization repeatedly hit `std::bad_alloc` during session creation.
+6. Added a page-level Hugging Face fetch limiter. A service-worker-only queue
+   still let too many long-lived model fetches pile up and hit browser request
+   timeouts; limiting large ONNX chunk fetches from the page was the practical
+   fix.
+7. Reworked sampling and UI updates so the browser was not sorting the whole
+   vocabulary or repainting on every tiny decode update.
+
+Quantization was also trial and error. A more aggressive fast q4 attempt that
+quantized all attention projections failed the reference top-5 validation. The
+published fast q4 path quantizes query/key projections but leaves the value
+projection unquantized. That version preserved top-1 agreement on the smoke
+prompt and produced the current default `model_kv_fast_q4f16.onnx` artifact.
+
+Current measured result: the same M4 Pro class smoke reached about **3.17 tok/s
+reported rolling token latency** and **3.11 tok/s p50 token latency** with
+`kv-cache` / `ort-direct`, a little over 5x the original steady token rate. The
+honest remaining work is cold load and TTFT: the measured cached run still took
+about **528.7s to Ready** and about **43.1s to first token**.
 
 ## Why This Exists
 

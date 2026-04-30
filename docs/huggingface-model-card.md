@@ -16,6 +16,8 @@ tags:
 - browser-ai
 - q4f16
 - q8
+- kv-cache
+- onnxruntime-web
 pipeline_tag: text-generation
 base_model: lewtun/talkie-1930-13b-it-hf
 ---
@@ -24,7 +26,8 @@ base_model: lewtun/talkie-1930-13b-it-hf
 
 Unofficial community q4f16/q8 ONNX + WebGPU quantization of
 [`lewtun/talkie-1930-13b-it-hf`](https://huggingface.co/lewtun/talkie-1930-13b-it-hf)
-for browser inference with Transformers.js.
+for browser inference with Transformers.js tokenizer/chat-template handling and
+direct ONNX Runtime WebGPU cached decoding.
 
 - Live browser demo: <https://scasella.github.io/talkie-quant-webgpu/>
 - GitHub runner and export scripts: <https://github.com/scasella/talkie-quant-webgpu>
@@ -63,6 +66,42 @@ generated token.
 The q4f16 files are larger than a theoretical pure 4-bit checkpoint because
 ONNX stores scales, metadata, and unquantized tensors. The cached files trade
 first-load size for faster steady per-token decoding.
+
+## Performance Journey
+
+This repo started with the browser as the acceptance test. The first validated
+path was the smaller full-sequence q4f16 graph: it loaded in Chrome/WebGPU and
+generated real text, but every new token reran the whole accumulated prompt. On
+the 24 GB M4 Pro smoke, that measured about `0.61 tok/s`.
+
+The current default is the result of a few browser-specific turns:
+
+- KV-cache ONNX export so decode can feed only the newest token after prefill.
+- A custom Talkie generation loop because this is not a stock Transformers.js
+  causal-LM architecture.
+- Direct `onnxruntime-web/webgpu` execution for the cached graph, while keeping
+  Transformers.js for tokenizer and chat-template handling.
+- Manual `input_ids`, `position_ids`, and `past_key_values.*` feeds, with
+  `present.*` cache tensors kept on GPU where possible and only logits copied
+  back for CPU sampling.
+- Browser graph optimization set to `disabled` after default optimization hit
+  `std::bad_alloc` during session creation.
+- A page-level Hugging Face fetch limiter. A service-worker-only queue still let
+  too many long model fetches accumulate and hit browser request timeouts.
+- Partial top-k sampling and throttled UI updates to keep JavaScript overhead
+  from dominating decode.
+
+The quantization path also had a failed candidate: quantizing all attention
+projections was faster-looking on paper but failed reference top-5 validation.
+The published fast q4f16 artifact quantizes query/key projections and leaves the
+value projection unquantized. That preserved top-1 agreement on the smoke prompt
+and produced the default `onnx/model_kv_fast_q4f16.onnx`.
+
+Current browser smoke result: `kv-cache` / `ort-direct` generated 16 non-NUL
+words at about `3.17 tok/s` reported rolling token latency and `3.11 tok/s` p50
+token latency, over 5x the original full-sequence steady token rate. Cold load
+is still the big caveat: about `528.7s` to `Ready` and about `43.1s` TTFT in
+the measured run.
 
 ## Files
 
