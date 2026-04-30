@@ -27,7 +27,10 @@
     "text-generation",
     "kv-cache",
     "onnxruntime-web",
-    "historical"
+    "historical",
+    "client-side-inference",
+    "edge-ai",
+    "apple-silicon"
   ],
   "scripts": {
     "dev": "vite --host 127.0.0.1",

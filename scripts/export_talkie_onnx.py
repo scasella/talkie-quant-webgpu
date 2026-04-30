@@ -1885,16 +1885,24 @@ tags:
 - onnx
 - webgpu
 - text-generation
+- llm
+- instruction-tuned
 - conversational
 - talkie
 - vintage
 - historical
 - quantized
+- onnxruntime
+- onnxruntime-web
+- kv-cache
 - browser-ai
+- browser
+- client-side-inference
+- edge-ai
+- apple-silicon
+- macos
 - q4f16
 - q8
-- kv-cache
-- onnxruntime-web
 pipeline_tag: text-generation
 base_model: {source_model}
 ---
@@ -1912,11 +1920,33 @@ WebGPU cached decoding.
 - Default browser dtype: `{default_dtype}`
 - Fallback dtype: `q8`
 - Stop token IDs: `{STOP_TOKEN_IDS}`
+- Best measured browser speed: `3.17 tok/s` reported rolling token latency on
+  a MacBook Pro with M4 Pro and 24 GB unified memory
 
 This model keeps the source tokenizer, chat template, generation config, and
 Apache-2.0 license metadata. It is not an official Talkie release. The ONNX
 artifacts validate outside the browser. The fast cached q4f16 path has also
-passed a Chrome/WebGPU smoke on a 24 GB M4 Pro with direct ONNX Runtime WebGPU.
+passed a Chrome/WebGPU smoke on a MacBook Pro with M4 Pro and 24 GB unified
+memory using direct ONNX Runtime WebGPU.
+
+## Badges And Discovery
+
+The model-card metadata is set so the Hugging Face page badges and filters match
+what this repo actually ships:
+
+- **License:** `apache-2.0`, matching the source model metadata and repo
+  license.
+- **Language:** `en`, because Talkie targets English text.
+- **Library:** `transformers.js`, because the browser runner uses
+  Transformers.js for tokenizer/chat-template handling.
+- **Task:** `text-generation`, because the artifact is a decoder-only chat/text
+  generation model even though the app uses a custom manual loop instead of
+  stock `pipeline("text-generation")`.
+- **Base model:** `{source_model}`, so Hugging Face links and filters this as a
+  quantized derivative of the source model.
+- **Discovery tags:** `webgpu`, `onnx`, `onnxruntime-web`, `kv-cache`,
+  `browser-ai`, `client-side-inference`, `edge-ai`, `apple-silicon`, `macos`,
+  `q4f16`, and `q8`.
 
 ## Quantization At A Glance
 
@@ -1944,7 +1974,8 @@ first-load size for faster steady per-token decoding.
 This repo started with the browser as the acceptance test. The first validated
 path was the smaller full-sequence q4f16 graph: it loaded in Chrome/WebGPU and
 generated real text, but every new token reran the whole accumulated prompt. On
-the 24 GB M4 Pro smoke, that measured about `0.61 tok/s`.
+the MacBook Pro M4 Pro / 24 GB unified-memory smoke, that measured about
+`0.61 tok/s`.
 
 The current default is the result of a few browser-specific turns:
 
@@ -2040,8 +2071,9 @@ ONNX Runtime loading, limited concurrent model fetches, and manual
   full-sequence wrapper with value projection left unquantized.
 - The cached q8 fallback validated against the same reference on the CPU
   provider and is kept as a browser/WebGPU fallback.
-- Chromium on a 24 GB M4 Pro loaded cached q4f16 with `cache=0`,
-  `opt=disabled`, and `fetches=6`, then generated 16 non-NUL words with
+- Chrome on a MacBook Pro with M4 Pro and 24 GB unified memory loaded cached
+  q4f16 with `cache=0`, `opt=disabled`, and `fetches=6`, then generated 16
+  non-NUL words with
   `kv-cache` / `ort-direct`, about `3.17 tok/s` reported rolling latency, and
   about `3.11 tok/s` p50 token latency.
 - Cold load remains slow: the measured run took about `528.7s` to `Ready` and

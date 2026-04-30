@@ -9,7 +9,7 @@ Use this checklist before publishing or tagging the repo.
 - Hub repo: `scasella91/talkie-1930-13b-it-ONNX`
 - Latest GitHub release: `v0.2.0` fast cached WebGPU path
 - Validated ONNX artifact commit: `631cbea56319f30469aae41af8fbd3078c460b3b`
-- Latest HF model-card update: `f10c5bb2a011617597546ab9d96b9cf482112bce`
+- Latest HF model-card update: `9fc209a5d4c0e0c0d603e824e07d5b8b4f68a214`
 - Browser default: `onnx/model_kv_fast_q4f16.onnx`
 - Fast cached q4 artifact: `onnx/model_kv_fast_q4f16.onnx`, `55` chunks,
   about `13.0 GB`

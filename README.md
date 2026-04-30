@@ -8,10 +8,11 @@ for Talkie 1930 13B, using
 tokenizer/chat-template handling and direct ONNX Runtime WebGPU for the default
 cached graph. There is no backend and no browser-exposed credential.
 The demo now defaults to a direct ONNX Runtime WebGPU KV-cache path. On a
-24 GB M4 Pro Chrome/WebGPU smoke, the additive fast cached q4f16 artifact
-generated 16 non-NUL words at about **3.17 tok/s reported rolling latency** /
-**3.11 tok/s p50 token latency** after cold load. First load is still large and
-slow, and first-token latency is still called out below.
+MacBook Pro with M4 Pro and 24 GB unified memory, the additive fast cached
+q4f16 artifact generated 16 non-NUL words in Chrome/WebGPU at about **3.17
+tok/s reported rolling latency** / **3.11 tok/s p50 token latency** after cold
+load. First load is still large and slow, and first-token latency is still
+called out below.
 
 - Live demo: <https://scasella.github.io/talkie-quant-webgpu/>
 - Hugging Face model: <https://huggingface.co/scasella91/talkie-1930-13b-it-ONNX>
@@ -75,11 +76,12 @@ published fast q4 path quantizes query/key projections but leaves the value
 projection unquantized. That version preserved top-1 agreement on the smoke
 prompt and produced the current default `model_kv_fast_q4f16.onnx` artifact.
 
-Current measured result: the same M4 Pro class smoke reached about **3.17 tok/s
-reported rolling token latency** and **3.11 tok/s p50 token latency** with
-`kv-cache` / `ort-direct`, a little over 5x the original steady token rate. The
-honest remaining work is cold load and TTFT: the measured cached run still took
-about **528.7s to Ready** and about **43.1s to first token**.
+Current measured result: the MacBook Pro M4 Pro / 24 GB unified-memory smoke
+reached about **3.17 tok/s reported rolling token latency** and **3.11 tok/s p50
+token latency** with `kv-cache` / `ort-direct`, a little over 5x the original
+steady token rate. The honest remaining work is cold load and TTFT: the
+measured cached run still took about **528.7s to Ready** and about **43.1s to
+first token**.
 
 ## Why This Exists
 
@@ -106,11 +108,11 @@ Open the live demo:
 https://scasella.github.io/talkie-quant-webgpu/
 ```
 
-The demo defaults to cached q4f16. On a 24 GB M4 Pro, the validated Chrome smoke
-loaded the fast cached q4f16 artifact in about 8.8 minutes, reached first token
-in about 43 seconds after sending the prompt, and then reported about 3.17 tok/s
-rolling token latency. The smaller full-sequence q4f16 fallback is still
-available in the model-path selector.
+The demo defaults to cached q4f16. On the validated MacBook Pro M4 Pro / 24 GB
+Chrome smoke, the fast cached q4f16 artifact loaded in about 8.8 minutes,
+reached first token in about 43 seconds after sending the prompt, and then
+reported about 3.17 tok/s rolling token latency. The smaller full-sequence
+q4f16 fallback is still available in the model-path selector.
 
 Run locally:
 
@@ -278,7 +280,8 @@ prompt; the all-projection fast q4 attempt failed top-5 validation and was not
 published as the default. The cached q8 fallback validated on the CPU provider
 and is kept as a fallback for browser/WebGPU compatibility testing.
 
-Current browser result on a 24 GB M4 Pro Chrome/WebGPU run:
+Current browser result on a MacBook Pro with M4 Pro and 24 GB unified memory
+using Chrome/WebGPU:
 
 - Cached q4f16 direct ORT reached `Ready` in Chromium with `cache=0`,
   `opt=disabled`, and `fetches=6`.
