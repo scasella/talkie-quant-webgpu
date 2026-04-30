@@ -13,7 +13,11 @@ import {
 import {
   ChatMessage,
   GenerationSettings,
+  GenerationStats,
+  LoadPath,
   LoadProgress,
+  RuntimeMode,
+  browserCacheEnabled,
   generateTalkieReply,
   hasWebGPU,
   loadTalkieRuntime,
@@ -35,7 +39,7 @@ const defaultSettings: GenerationSettings = {
   topK: 50
 };
 
-type LoadTarget = "q4f16" | "q8";
+type LoadTarget = "kv-q4f16" | "kv-q8" | "full-q4f16" | "full-q8";
 
 interface FileLoadState {
   loaded: number;
@@ -54,20 +58,43 @@ const DEFAULT_LOAD_METER: LoadMeter = {
   percent: null
 };
 
-const TARGET_TOTAL_BYTES: Record<LoadTarget, number> = {
-  q4f16: 10_583_998_959,
-  q8: 15_312_926_922
+const DEFAULT_LOAD_PATH = defaultLoadPath();
+
+const TARGETS: Record<LoadTarget, { label: string; bytes: number; needles: string[] }> = {
+  "kv-q4f16": {
+    label: "cached q4f16",
+    bytes: 16_529_366_674,
+    needles: ["model_kv_q4f16.onnx"]
+  },
+  "kv-q8": {
+    label: "cached q8",
+    bytes: 21_603_959_630,
+    needles: ["model_kv_quantized.onnx"]
+  },
+  "full-q4f16": {
+    label: "full q4f16",
+    bytes: 10_583_999_732,
+    needles: ["model_q4f16.onnx"]
+  },
+  "full-q8": {
+    label: "full q8",
+    bytes: 15_312_927_660,
+    needles: ["model_quantized.onnx"]
+  }
 };
 
 function App() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [draft, setDraft] = useState("");
   const [settings, setSettings] = useState(defaultSettings);
+  const [loadPath, setLoadPath] = useState<LoadPath>(DEFAULT_LOAD_PATH);
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [status, setStatus] = useState("Idle");
   const [loadMeter, setLoadMeter] = useState<LoadMeter>(DEFAULT_LOAD_METER);
   const [dtype, setDtype] = useState("unloaded");
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode | "not loaded">("not loaded");
+  const [tokenRate, setTokenRate] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const loadFilesRef = useRef<Map<string, FileLoadState>>(new Map());
@@ -80,6 +107,10 @@ function App() {
   const handleProgress = (event: LoadProgress) => {
     setLoadMeter(updateLoadMeter(event, loadFilesRef.current, loadTargetRef, bestLoadPercentRef));
     if (event.status) setStatus(event.status);
+  };
+  const handleGenerationStats = (stats: GenerationStats) => {
+    setRuntimeMode(stats.mode);
+    setTokenRate(stats.tokensPerSecond);
   };
 
   const loadModel = async () => {
@@ -95,12 +126,13 @@ function App() {
       percent: 0
     });
     try {
-      const runtime = await loadTalkieRuntime(handleProgress);
+      const runtime = await loadTalkieRuntime(handleProgress, loadPath);
       setDtype(runtime.session.dtype);
+      setRuntimeMode(runtime.session.mode);
       setStatus("Ready");
       setLoadMeter({
         label: "Ready",
-        detail: `Loaded ${runtime.session.dtype}`,
+        detail: `Loaded ${runtime.session.dtype} ${runtime.session.mode}`,
         percent: 100
       });
     } catch (err) {
@@ -117,12 +149,18 @@ function App() {
   };
 
   const resetModel = async () => {
+    if (loading) {
+      window.location.reload();
+      return;
+    }
     setError(null);
     setLoading(true);
     setStatus("Resetting");
     try {
       await resetTalkieRuntime();
       setDtype("unloaded");
+      setRuntimeMode("not loaded");
+      setTokenRate(null);
       loadFilesRef.current.clear();
       loadTargetRef.current = null;
       bestLoadPercentRef.current = 0;
@@ -159,6 +197,7 @@ function App() {
     abortRef.current = controller;
     setGenerating(true);
     setStatus("Thinking");
+    setTokenRate(null);
 
     const nextMessages: ChatMessage[] = [...messages, { role: "user", content: prompt }, { role: "assistant", content: "" }];
     setMessages(nextMessages);
@@ -175,7 +214,8 @@ function App() {
           });
         },
         controller.signal,
-        handleProgress
+        handleProgress,
+        handleGenerationStats
       );
       setStatus(controller.signal.aborted ? "Stopped" : "Ready");
     } catch (err) {
@@ -205,6 +245,9 @@ function App() {
               <Gauge size={16} />
               {dtype}
             </span>
+            <span className="status">{runtimeMode}</span>
+            <span className="status">{tokenRate == null ? "tok/s --" : `${tokenRate.toFixed(2)} tok/s`}</span>
+            <span className="status">cache {browserCacheEnabled() ? "on" : "off"}</span>
             <span className="status">{status}</span>
           </div>
         </header>
@@ -215,7 +258,7 @@ function App() {
               {loading ? <Loader2 className="spin" size={18} /> : <Zap size={18} />}
               Load
             </button>
-            <button type="button" onClick={resetModel} disabled={loading || generating} title="Reload model">
+            <button type="button" onClick={resetModel} disabled={generating} title="Reload model">
               <RefreshCw size={18} />
               Reset
             </button>
@@ -223,6 +266,18 @@ function App() {
               <Trash2 size={18} />
               Clear
             </button>
+
+            <label>
+              <span>Model path</span>
+              <select
+                value={loadPath}
+                onChange={(event) => setLoadPath(event.currentTarget.value as LoadPath)}
+                disabled={loading || generating}
+              >
+                <option value="full">Smaller q4f16</option>
+                <option value="cached">Cached q4f16</option>
+              </select>
+            </label>
 
             <label>
               <span>Temperature</span>
@@ -336,7 +391,10 @@ function updateLoadMeter(
 ): LoadMeter {
   const file = event.file ?? "";
   const target = detectLoadTarget(file);
-  if (target) targetRef.current = target;
+  if (target && target !== targetRef.current) {
+    targetRef.current = target;
+    bestPercentRef.current = 0;
+  }
 
   const loaded = finiteNumber(event.loaded);
   const total = finiteNumber(event.total);
@@ -358,24 +416,26 @@ function updateLoadMeter(
   bestPercentRef.current = nextPercent;
 
   return {
-    label: activeTarget ? `Loading ${activeTarget}` : "Preparing model",
+    label: activeTarget ? `Loading ${TARGETS[activeTarget].label}` : "Preparing model",
     detail: readableProgressDetail(file, event.status),
     percent: nextPercent
   };
 }
 
 function aggregateTargetPercent(files: Map<string, FileLoadState>, target: LoadTarget): number {
-  const needle = target === "q8" ? "model_quantized.onnx" : "model_q4f16.onnx";
+  const { bytes, needles } = TARGETS[target];
   let loaded = 0;
   for (const [file, state] of files) {
-    if (file.includes(needle)) loaded += state.loaded;
+    if (needles.some((needle) => file.includes(needle))) loaded += state.loaded;
   }
-  return (loaded / TARGET_TOTAL_BYTES[target]) * 100;
+  return (loaded / bytes) * 100;
 }
 
 function detectLoadTarget(file: string): LoadTarget | null {
-  if (file.includes("model_quantized.onnx")) return "q8";
-  if (file.includes("model_q4f16.onnx")) return "q4f16";
+  if (file.includes("model_kv_q4f16.onnx")) return "kv-q4f16";
+  if (file.includes("model_kv_quantized.onnx")) return "kv-q8";
+  if (file.includes("model_q4f16.onnx")) return "full-q4f16";
+  if (file.includes("model_quantized.onnx")) return "full-q8";
   return null;
 }
 
@@ -399,6 +459,11 @@ function finiteNumber(value: unknown): number | null {
 function sentenceCase(value: string): string {
   if (!value) return value;
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function defaultLoadPath(): LoadPath {
+  if (typeof window === "undefined") return "full";
+  return new URLSearchParams(window.location.search).get("path") === "cached" ? "cached" : "full";
 }
 
 export default App;

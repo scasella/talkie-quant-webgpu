@@ -23,6 +23,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -157,11 +158,17 @@ button:disabled {
   accent-color: #2f6f5e;
 }
 
+.controls select,
 .controls input[type="number"] {
   width: 82px;
   border: 1px solid #151514;
   border-radius: 6px;
   padding: 8px;
+}
+
+.controls select {
+  width: 148px;
+  background: #ffffff;
 }
 
 .meter {

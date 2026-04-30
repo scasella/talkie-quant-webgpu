@@ -31,7 +31,10 @@ DEFAULT_OUTPUT_REPO = "scasella91/talkie-1930-13b-it-ONNX"
 DEFAULT_MAX_SEQ_LEN = 2048
 DEFAULT_OPSET = 18
 STOP_TOKEN_IDS = [65535, 65536]
-DEFAULT_EXTERNAL_DATA_CHUNK_MIB = 1024
+DEFAULT_EXTERNAL_DATA_CHUNK_MIB = 512
+FULL_SEQUENCE_ONNX_FILES = ("model_q4f16.onnx", "model_quantized.onnx")
+KV_CACHE_ONNX_FILES = ("model_kv_q4f16.onnx", "model_kv_quantized.onnx")
+BROWSER_ONNX_FILES = (*FULL_SEQUENCE_ONNX_FILES, *KV_CACHE_ONNX_FILES)
 METADATA_FILES = [
     "config.json",
     "tokenizer.json",
@@ -157,12 +160,147 @@ class TalkieFullSequenceOnnxWrapper(nn.Module):
         return logits
 
 
+class TalkieKvCacheOnnxWrapper(TalkieFullSequenceOnnxWrapper):
+    """Decoder-only cached export wrapper with explicit past/present tensors."""
+
+    def __init__(self, model: nn.Module, max_seq_len: int, compute_dtype: torch.dtype = torch.float32):
+        super().__init__(model, max_seq_len, compute_dtype=compute_dtype)
+        self.num_layers = len(model.model.blocks)
+        self.num_heads = model.config.num_attention_heads
+
+    def cache_input_names(self) -> list[str]:
+        names: list[str] = []
+        for layer in range(self.num_layers):
+            names.extend(
+                [
+                    f"past_key_values.{layer}.key",
+                    f"past_key_values.{layer}.value",
+                ]
+            )
+        return names
+
+    def cache_output_names(self) -> list[str]:
+        names: list[str] = []
+        for layer in range(self.num_layers):
+            names.extend(
+                [
+                    f"present.{layer}.key",
+                    f"present.{layer}.value",
+                ]
+            )
+        return names
+
+    def make_past_inputs(
+        self,
+        batch: int,
+        past_len: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        cache_dtype = dtype or self.compute_dtype
+        tensors: list[torch.Tensor] = []
+        for _layer in range(self.num_layers):
+            tensors.append(torch.zeros(batch, self.num_heads, past_len, self.head_dim, device=device, dtype=cache_dtype))
+            tensors.append(torch.zeros(batch, self.num_heads, past_len, self.head_dim, device=device, dtype=cache_dtype))
+        return tuple(tensors)
+
+    def _select_rope(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = position_ids[0].to(dtype=torch.long)
+        cos = self.rope_cos.index_select(1, positions)
+        sin = self.rope_sin.index_select(1, positions)
+        return cos, sin
+
+    def _select_causal_mask(self, position_ids: torch.Tensor, total_len: int) -> torch.Tensor:
+        positions = position_ids[0].to(dtype=torch.long)
+        return self.causal_mask.index_select(2, positions)[:, :, :, :total_len]
+
+    def _attention_cached(
+        self,
+        attn: nn.Module,
+        x: torch.Tensor,
+        seq_len: int,
+        position_ids: torch.Tensor,
+        past_key: torch.Tensor,
+        past_value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch = x.shape[0]
+        cos, sin = self._select_rope(position_ids)
+        q = self._linear(x, attn.attn_query.weight).view(batch, seq_len, attn.n_head, attn.head_dim)
+        k = self._linear(x, attn.attn_key.weight).view(batch, seq_len, attn.n_head, attn.head_dim)
+        v = self._linear(x, attn.attn_value.weight).view(batch, seq_len, attn.n_head, attn.head_dim)
+
+        q = self._apply_rotary_emb(q, cos, sin)
+        k = self._apply_rotary_emb(k, cos, sin)
+        q = self._rms_norm(q)
+        k = self._rms_norm(k)
+        q = q * attn.head_gain.head_g.to(dtype=q.dtype).view(1, 1, -1, 1)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        present_key = torch.cat([past_key.to(dtype=k.dtype), k], dim=2)
+        present_value = torch.cat([past_value.to(dtype=v.dtype), v], dim=2)
+        total_len = present_key.shape[2]
+        scores = torch.matmul(q.float(), present_key.float().transpose(-2, -1)) * self.attn_scale
+        scores = scores + self._select_causal_mask(position_ids, total_len)
+        probs = torch.softmax(scores, dim=-1).to(dtype=present_value.dtype)
+        y = torch.matmul(probs, present_value)
+        y = y.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self._linear(y, attn.attn_resid.weight), present_key, present_value
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, *past_key_values: torch.Tensor):
+        seq_len = input_ids.shape[1]
+        x = self._embed(input_ids)
+        x = self._rms_norm(x)
+        e_x = x
+        presents: list[torch.Tensor] = []
+        for index, block in enumerate(self.model.model.blocks):
+            attn_in = self._rms_norm(x)
+            past_key = past_key_values[index * 2]
+            past_value = past_key_values[index * 2 + 1]
+            attn_out, present_key, present_value = self._attention_cached(
+                block.attn,
+                attn_in,
+                seq_len,
+                position_ids,
+                past_key,
+                past_value,
+            )
+            presents.extend([present_key, present_value])
+            x = x + attn_out * block.attn_gain.a_g.to(dtype=attn_out.dtype)
+            mlp_in = self._rms_norm(x)
+            mlp_out = self._mlp(block.mlp, mlp_in)
+            x = x + mlp_out * block.mlp_gain.a_g.to(dtype=mlp_out.dtype)
+            x = x + e_x * block.embed_skip.a_g.to(dtype=e_x.dtype)
+        hidden_states = self._rms_norm(x)
+        lm_head = self._compute(self.model.lm_head_gain(self.model.lm_head))
+        logits = F.linear(hidden_states, lm_head).float()
+        return (logits, *presents)
+
+
 @dataclass
 class ValidationResult:
     name: str
     top1: int
     reference_top5: list[int]
     passed: bool
+
+
+@dataclass
+class KvCacheSpec:
+    num_layers: int
+    num_heads: int
+    head_dim: int
+
+    def cache_input_names(self) -> list[str]:
+        names: list[str] = []
+        for layer in range(self.num_layers):
+            names.extend([f"past_key_values.{layer}.key", f"past_key_values.{layer}.value"])
+        return names
+
+
+def kv_cache_spec_from_wrapper(wrapper: TalkieKvCacheOnnxWrapper) -> KvCacheSpec:
+    return KvCacheSpec(num_layers=wrapper.num_layers, num_heads=wrapper.num_heads, head_dim=wrapper.head_dim)
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
@@ -260,30 +398,193 @@ def export_onnx(
     torch.onnx.export(wrapper, **kwargs)
 
 
+def export_kv_onnx(
+    wrapper: TalkieKvCacheOnnxWrapper,
+    input_ids: torch.Tensor,
+    onnx_path: Path,
+    opset: int,
+    max_seq_len: int,
+    export_past_len: int,
+) -> None:
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    remove_onnx_sidecars(onnx_path)
+
+    batch = input_ids.shape[0]
+    seq_len = input_ids.shape[1]
+    device = input_ids.device
+    position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch, seq_len)
+    past_inputs = wrapper.make_past_inputs(batch, export_past_len, device=device)
+    input_names = ["input_ids", "position_ids", *wrapper.cache_input_names()]
+    output_names = ["logits", *wrapper.cache_output_names()]
+    dynamic_axes = {
+        "input_ids": {0: "batch", 1: "sequence"},
+        "position_ids": {0: "batch", 1: "sequence"},
+        "logits": {0: "batch", 1: "sequence"},
+    }
+    for name in wrapper.cache_input_names():
+        dynamic_axes[name] = {0: "batch", 2: "past_sequence"}
+    for name in wrapper.cache_output_names():
+        dynamic_axes[name] = {0: "batch", 2: "total_sequence"}
+
+    try:
+        from torch.onnx._internal.torchscript_exporter import _globals as torchscript_exporter_globals
+
+        torchscript_exporter_globals.GLOBALS.onnx_shape_inference = False
+    except Exception:
+        pass
+
+    torch.onnx.export(
+        wrapper,
+        args=(input_ids, position_ids, *past_inputs),
+        f=str(onnx_path),
+        input_names=input_names,
+        output_names=output_names,
+        opset_version=opset,
+        dynamic_axes=dynamic_axes,
+        external_data=True,
+        dynamo=False,
+        do_constant_folding=False,
+    )
+
+
 def validate_onnx(
     onnx_path: Path,
     input_ids: torch.Tensor,
     name: str,
     reference_top5: list[int],
     require_top1_match: bool,
+    providers: list[str] | None = None,
 ) -> ValidationResult:
     import onnxruntime as ort
 
     session_options = ort.SessionOptions()
     session_options.enable_mem_pattern = False
     session_options.enable_cpu_mem_arena = False
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    session = ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=providers)
+    provider_names = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=provider_names)
     output_name = session.get_outputs()[0].name
     got = session.run([output_name], {"input_ids": input_ids.cpu().numpy().astype(np.int64)})[0]
     got_top1 = int(np.argmax(got[0, -1]))
+    got_top5 = np.argsort(got[0, -1])[-5:][::-1].astype(int).tolist()
+    logits = got[0, -1].astype(np.float32, copy=False)
     passed = got_top1 == reference_top5[0] if require_top1_match else got_top1 in reference_top5
     print(
         json.dumps(
             {
                 "validation": name,
                 "top1": got_top1,
+                "top5": got_top5,
                 "reference_top5": reference_top5,
+                "providers": provider_names,
+                "logits_finite": bool(np.isfinite(logits).all()),
+                "logits_min": float(np.nanmin(logits)),
+                "logits_max": float(np.nanmax(logits)),
+                "logits_mean": float(np.nanmean(logits)),
+                "passed": passed,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    del got
+    del session
+    gc.collect()
+    return ValidationResult(name=name, top1=got_top1, reference_top5=reference_top5, passed=passed)
+
+
+def kv_position_ids(batch: int, start: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(start, start + seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch, seq_len)
+
+
+def empty_kv_cache(wrapper: TalkieKvCacheOnnxWrapper, batch: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+    return wrapper.make_past_inputs(batch, 0, device=device)
+
+
+def reference_top5_from_kv_wrapper(wrapper: TalkieKvCacheOnnxWrapper, input_ids: torch.Tensor) -> list[int]:
+    device = next(wrapper.parameters()).device
+    input_ids = input_ids.to(device)
+    cache = empty_kv_cache(wrapper, input_ids.shape[0], device)
+    position_ids = kv_position_ids(input_ids.shape[0], 0, input_ids.shape[1], device)
+    with torch.inference_mode():
+        outputs = wrapper(input_ids, position_ids, *cache)
+        reference = outputs[0].detach().float().cpu().numpy()
+    return np.argsort(reference[0, -1])[-5:][::-1].astype(int).tolist()
+
+
+def validate_kv_wrapper_against_full_wrapper(
+    full_wrapper: TalkieFullSequenceOnnxWrapper,
+    kv_wrapper: TalkieKvCacheOnnxWrapper,
+    input_ids: torch.Tensor,
+) -> None:
+    device = next(kv_wrapper.parameters()).device
+    input_ids = input_ids.to(device)
+    cache = empty_kv_cache(kv_wrapper, input_ids.shape[0], device)
+    position_ids = kv_position_ids(input_ids.shape[0], 0, input_ids.shape[1], device)
+    with torch.inference_mode():
+        reference = full_wrapper(input_ids).detach().float().cpu().numpy()
+        got = kv_wrapper(input_ids, position_ids, *cache)[0].detach().float().cpu().numpy()
+    reference_top5 = np.argsort(reference[0, -1])[-5:][::-1].astype(int).tolist()
+    got_top1 = int(np.argmax(got[0, -1]))
+    passed = got_top1 in reference_top5
+    print(
+        json.dumps(
+            {
+                "validation": "kv_wrapper_vs_full_wrapper",
+                "kv_top1": got_top1,
+                "full_top5": reference_top5,
+                "passed": passed,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    if not passed:
+        raise RuntimeError("KV wrapper does not match full-sequence wrapper top-5")
+
+
+def validate_kv_onnx(
+    onnx_path: Path,
+    kv_spec: KvCacheSpec,
+    input_ids: torch.Tensor,
+    name: str,
+    reference_top5: list[int],
+    require_top1_match: bool,
+    providers: list[str] | None = None,
+) -> ValidationResult:
+    import onnxruntime as ort
+
+    session_options = ort.SessionOptions()
+    session_options.enable_mem_pattern = False
+    session_options.enable_cpu_mem_arena = False
+    provider_names = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session = ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=provider_names)
+    input_types = {item.name: item.type for item in session.get_inputs()}
+    batch = input_ids.shape[0]
+    seq_len = input_ids.shape[1]
+    feed: dict[str, np.ndarray] = {
+        "input_ids": input_ids.cpu().numpy().astype(np.int64),
+        "position_ids": np.arange(seq_len, dtype=np.int64)[None, :].repeat(batch, axis=0),
+    }
+    for cache_name in kv_spec.cache_input_names():
+        cache_dtype = np.float16 if "float16" in input_types.get(cache_name, "") else np.float32
+        feed[cache_name] = np.zeros((batch, kv_spec.num_heads, 0, kv_spec.head_dim), dtype=cache_dtype)
+    got = session.run(["logits"], feed)[0]
+    got_top1 = int(np.argmax(got[0, -1]))
+    got_top5 = np.argsort(got[0, -1])[-5:][::-1].astype(int).tolist()
+    logits = got[0, -1].astype(np.float32, copy=False)
+    passed = got_top1 == reference_top5[0] if require_top1_match else got_top1 in reference_top5
+    print(
+        json.dumps(
+            {
+                "validation": name,
+                "top1": got_top1,
+                "top5": got_top5,
+                "reference_top5": reference_top5,
+                "providers": provider_names,
+                "logits_finite": bool(np.isfinite(logits).all()),
+                "logits_min": float(np.nanmin(logits)),
+                "logits_max": float(np.nanmax(logits)),
+                "logits_mean": float(np.nanmean(logits)),
                 "passed": passed,
             },
             indent=2,
@@ -337,8 +638,8 @@ def release_cuda_memory() -> None:
 
 
 def remove_onnx_sidecars(model_path: Path) -> None:
-    data_path = model_path.with_name(f"{model_path.name}_data")
-    for path in (model_path, data_path):
+    paths = [model_path, *model_path.parent.glob(f"{model_path.name}_data*")]
+    for path in paths:
         if path.exists():
             path.unlink()
 
@@ -378,6 +679,160 @@ def data_chunk_name(model_path: Path, chunk_index: int) -> str:
     return base if chunk_index == 0 else f"{base}_{chunk_index}"
 
 
+def tensor_byte_size(tensor) -> int:
+    import onnx
+
+    elem_size = {
+        onnx.TensorProto.FLOAT: 4,
+        onnx.TensorProto.FLOAT16: 2,
+        onnx.TensorProto.BFLOAT16: 2,
+        onnx.TensorProto.DOUBLE: 8,
+        onnx.TensorProto.INT8: 1,
+        onnx.TensorProto.UINT8: 1,
+        onnx.TensorProto.INT16: 2,
+        onnx.TensorProto.UINT16: 2,
+        onnx.TensorProto.INT32: 4,
+        onnx.TensorProto.UINT32: 4,
+        onnx.TensorProto.INT64: 8,
+        onnx.TensorProto.UINT64: 8,
+        onnx.TensorProto.BOOL: 1,
+    }.get(tensor.data_type)
+    if elem_size is None:
+        return int(external_value(tensor, "length") or 0)
+    elements = 1
+    for dim in tensor.dims:
+        elements *= int(dim)
+    return elements * elem_size
+
+
+def unique_graph_name(used_names: set[str], base: str) -> str:
+    candidate = base
+    index = 0
+    while candidate in used_names:
+        index += 1
+        candidate = f"{base}_{index}"
+    used_names.add(candidate)
+    return candidate
+
+
+def collect_graph_names(model) -> set[str]:
+    names: set[str] = set()
+    for initializer in model.graph.initializer:
+        names.add(initializer.name)
+    for value in [*model.graph.input, *model.graph.output, *model.graph.value_info]:
+        names.add(value.name)
+    for node in model.graph.node:
+        if node.name:
+            names.add(node.name)
+        names.update(name for name in node.input if name)
+        names.update(name for name in node.output if name)
+    return names
+
+
+def choose_initializer_shard_axis(shape: tuple[int, ...], itemsize: int, chunk_size_bytes: int) -> tuple[int, int] | None:
+    if not shape or itemsize <= 0:
+        return None
+    best: tuple[int, int] | None = None
+    for axis, dim in enumerate(shape):
+        if dim <= 1:
+            continue
+        row_bytes = itemsize
+        for index, other_dim in enumerate(shape):
+            if index != axis:
+                row_bytes *= int(other_dim)
+        if row_bytes <= 0:
+            continue
+        shard_extent = max(1, chunk_size_bytes // row_bytes)
+        shard_count = (int(dim) + shard_extent - 1) // shard_extent
+        if shard_count <= 1:
+            continue
+        candidate = (axis, int(shard_extent))
+        if best is None or shard_count < ((shape[best[0]] + best[1] - 1) // best[1]):
+            best = candidate
+    return best
+
+
+def shard_large_initializers(model, chunk_size_bytes: int) -> int:
+    import onnx
+    from onnx import helper, numpy_helper
+
+    used_names = collect_graph_names(model)
+    replacements: list[tuple[str, list[object]]] = []
+    concat_nodes = []
+    kept_initializers = []
+
+    for initializer in model.graph.initializer:
+        byte_size = tensor_byte_size(initializer)
+        if byte_size <= chunk_size_bytes:
+            kept_initializers.append(initializer)
+            continue
+
+        array = numpy_helper.to_array(initializer)
+        shard_plan = choose_initializer_shard_axis(array.shape, array.dtype.itemsize, chunk_size_bytes)
+        if shard_plan is None:
+            kept_initializers.append(initializer)
+            print(
+                json.dumps(
+                    {
+                        "large_initializer_not_sharded": initializer.name,
+                        "bytes": int(array.nbytes),
+                        "shape": list(array.shape),
+                    }
+                ),
+                flush=True,
+            )
+            continue
+
+        axis, shard_extent = shard_plan
+        shard_initializers = []
+        shard_names = []
+        for shard_index, start in enumerate(range(0, array.shape[axis], shard_extent)):
+            end = min(start + shard_extent, array.shape[axis])
+            slices = [slice(None)] * array.ndim
+            slices[axis] = slice(start, end)
+            shard_array = np.ascontiguousarray(array[tuple(slices)])
+            shard_name = unique_graph_name(used_names, f"{initializer.name}__shard_{shard_index}")
+            shard_initializers.append(numpy_helper.from_array(shard_array, name=shard_name))
+            shard_names.append(shard_name)
+
+        concat_name = unique_graph_name(used_names, f"{initializer.name}__concat")
+        concat_nodes.append(helper.make_node("Concat", shard_names, [initializer.name], name=concat_name, axis=axis))
+        replacements.append((initializer.name, shard_initializers))
+        print(
+            json.dumps(
+                {
+                    "sharded_initializer": initializer.name,
+                    "bytes": int(array.nbytes),
+                    "shape": list(array.shape),
+                    "axis": axis,
+                    "shards": len(shard_initializers),
+                }
+            ),
+            flush=True,
+        )
+
+    if not replacements:
+        return 0
+
+    original_nodes = list(model.graph.node)
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(kept_initializers)
+    for _name, shard_initializers in replacements:
+        model.graph.initializer.extend(shard_initializers)
+    del model.graph.node[:]
+    model.graph.node.extend([*concat_nodes, *original_nodes])
+    return len(replacements)
+
+
+def normalize_and_shard_external_data(model_path: Path, chunk_size_bytes: int) -> int:
+    import onnx
+
+    model = onnx.load_model(str(model_path), load_external_data=True)
+    sharded = shard_large_initializers(model, chunk_size_bytes)
+    save_onnx_external(model, model_path)
+    return sharded
+
+
 def split_external_data_file(model_path: Path, chunk_size_bytes: int) -> int:
     import onnx
 
@@ -400,6 +855,7 @@ def split_external_data_file(model_path: Path, chunk_size_bytes: int) -> int:
         locations = {external_value(initializer, "location") for initializer in external_initializers}
         chunk_count = len(existing_chunks) + 1
         expected_locations = {data_chunk_name(model_path, index) for index in range(chunk_count)}
+        existing_paths = [source_path, *existing_chunks]
         if locations and locations != {source_name} and locations <= expected_locations:
             missing_chunks = [
                 model_path.with_name(data_chunk_name(model_path, index))
@@ -408,9 +864,44 @@ def split_external_data_file(model_path: Path, chunk_size_bytes: int) -> int:
             ]
             if missing_chunks:
                 raise FileNotFoundError(", ".join(str(path) for path in missing_chunks))
-            return chunk_count
+            if max(path.stat().st_size for path in existing_paths) <= chunk_size_bytes:
+                return chunk_count
+            print(f"Repacking {model_path.name}: at least one external-data chunk exceeds target size", flush=True)
+            normalize_and_shard_external_data(model_path, chunk_size_bytes)
+            source_path = model_path.with_name(data_chunk_name(model_path, 0))
+            model = onnx.load_model(str(model_path), load_external_data=False)
+            external_initializers = [
+                initializer
+                for initializer in model.graph.initializer
+                if initializer.data_location == onnx.TensorProto.EXTERNAL
+            ]
         if source_path.stat().st_size <= chunk_size_bytes:
             return chunk_count
+
+    oversized_initializers = [
+        initializer.name
+        for initializer in external_initializers
+        if tensor_byte_size(initializer) > chunk_size_bytes
+    ]
+    if oversized_initializers:
+        print(
+            json.dumps(
+                {
+                    "repacking_large_initializers": model_path.name,
+                    "count": len(oversized_initializers),
+                    "examples": oversized_initializers[:5],
+                }
+            ),
+            flush=True,
+        )
+        normalize_and_shard_external_data(model_path, chunk_size_bytes)
+        source_path = model_path.with_name(data_chunk_name(model_path, 0))
+        model = onnx.load_model(str(model_path), load_external_data=False)
+        external_initializers = [
+            initializer
+            for initializer in model.graph.initializer
+            if initializer.data_location == onnx.TensorProto.EXTERNAL
+        ]
 
     for initializer in external_initializers:
         if external_value(initializer, "location") != source_name:
@@ -489,7 +980,7 @@ def split_browser_external_data(onnx_dir: Path, chunk_mib: int) -> dict[str, int
         raise ValueError("External data chunk size must be positive")
 
     chunk_counts: dict[str, int] = {}
-    for name in ("model_q4f16.onnx", "model_quantized.onnx"):
+    for name in BROWSER_ONNX_FILES:
         model_path = onnx_dir / name
         if not model_path.exists():
             continue
@@ -1065,7 +1556,14 @@ def insert_regular_matmul_input_casts(model, types: dict[str, int]) -> int:
         if node.op_type == "MatMul" and len(node.input) >= 2 and node.output:
             output_type = types.get(node.output[0])
             input_types = [types.get(node.input[0]), types.get(node.input[1])]
-            target_type = output_type if output_type in supported_types else None
+            initializer_input_types = [
+                input_type
+                for input_name, input_type in zip(node.input[:2], input_types)
+                if input_name in initializers and input_type in supported_types
+            ]
+            target_type = initializer_input_types[0] if initializer_input_types else None
+            if target_type is None and output_type in supported_types:
+                target_type = output_type
             if target_type is None:
                 known = [item for item in input_types if item in supported_types]
                 target_type = known[0] if known else None
@@ -1119,6 +1617,48 @@ def insert_elementwise_input_casts(model, types: dict[str, int]) -> int:
                     clean_name = (node.name or f"{node.op_type}_{inserted}").replace("/", "_").strip("_")
                     cast_output = f"{node.input[input_index]}__{clean_name}_input{input_index}_cast_to_{target_type}"
                     cast_name = f"{node.name or clean_name}_CastInput{input_index}ToOutputType"
+                    new_nodes.append(
+                        helper.make_node(
+                            "Cast",
+                            inputs=[node.input[input_index]],
+                            outputs=[cast_output],
+                            name=cast_name,
+                            to=target_type,
+                        )
+                    )
+                    node.input[input_index] = cast_output
+                    inserted += 1
+        new_nodes.append(node)
+
+    if inserted:
+        del model.graph.node[:]
+        model.graph.node.extend(new_nodes)
+    return inserted
+
+
+def insert_concat_input_casts(model, types: dict[str, int]) -> int:
+    import onnx
+    from onnx import helper
+
+    supported_types = {onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16}
+    inserted = 0
+    new_nodes = []
+
+    for node in model.graph.node:
+        if node.op_type == "Concat" and len(node.input) >= 2 and node.output:
+            output_type = types.get(node.output[0])
+            input_types = [types.get(name) for name in node.input]
+            target_type = output_type if output_type in supported_types else None
+            if target_type is None:
+                known_types = [item for item in input_types if item in supported_types]
+                target_type = known_types[0] if known_types else None
+            if target_type in supported_types:
+                for input_index, input_type in enumerate(input_types):
+                    if input_type == target_type:
+                        continue
+                    clean_name = (node.name or f"Concat_{inserted}").replace("/", "_").strip("_")
+                    cast_output = f"{node.input[input_index]}__{clean_name}_input{input_index}_cast_to_{target_type}"
+                    cast_name = f"{node.name or clean_name}_CastInput{input_index}ToConcatType"
                     new_nodes.append(
                         helper.make_node(
                             "Cast",
@@ -1195,6 +1735,25 @@ def align_saved_elementwise_runtime_types(model_path: Path) -> int:
         gc.collect()
 
 
+def align_saved_concat_runtime_types(model_path: Path) -> int:
+    import onnx
+
+    model = onnx.load_model(str(model_path), load_external_data=False)
+    try:
+        try:
+            typed_model = onnx.shape_inference.infer_shapes(model)
+            types = build_value_type_map(typed_model)
+        except Exception:
+            types = build_value_type_map(model)
+        inserted = insert_concat_input_casts(model, types)
+        if inserted:
+            onnx.save_model(model, str(model_path))
+        return inserted
+    finally:
+        del model
+        gc.collect()
+
+
 def strip_saved_value_info(model_path: Path) -> int:
     import onnx
 
@@ -1210,6 +1769,37 @@ def strip_saved_value_info(model_path: Path) -> int:
         gc.collect()
 
 
+def dedupe_saved_node_names(model_path: Path) -> int:
+    import onnx
+
+    model = onnx.load_model(str(model_path), load_external_data=False)
+    try:
+        seen: set[str] = set()
+        renamed = 0
+        for index, node in enumerate(model.graph.node):
+            if not node.name:
+                continue
+            original = node.name
+            if original not in seen:
+                seen.add(original)
+                continue
+            base = original.replace("/", "_").strip("_") or node.op_type or "node"
+            suffix = 1
+            candidate = f"{base}_dedup_{index}_{suffix}"
+            while candidate in seen:
+                suffix += 1
+                candidate = f"{base}_dedup_{index}_{suffix}"
+            node.name = candidate
+            seen.add(candidate)
+            renamed += 1
+        if renamed:
+            onnx.save_model(model, str(model_path))
+        return renamed
+    finally:
+        del model
+        gc.collect()
+
+
 def update_transformers_js_config(out_dir: Path, external_data_chunks: dict[str, int] | None = None) -> None:
     config_path = out_dir / "config.json"
     if config_path.exists():
@@ -1218,10 +1808,15 @@ def update_transformers_js_config(out_dir: Path, external_data_chunks: dict[str,
         config = {}
     transformers_js_config = config.setdefault("transformers.js_config", {})
     transformers_js_config.setdefault("dtype", "q4f16")
-    transformers_js_config["use_external_data_format"] = external_data_chunks or {
+    existing_external = transformers_js_config.get("use_external_data_format")
+    if not isinstance(existing_external, dict):
+        existing_external = {}
+    defaults = {
         "model_q4f16.onnx": 1,
         "model_quantized.onnx": 1,
     }
+    existing_external = {**defaults, **existing_external, **(external_data_chunks or {})}
+    transformers_js_config["use_external_data_format"] = existing_external
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
@@ -1286,30 +1881,40 @@ with Transformers.js.
 - Stop token IDs: `{STOP_TOKEN_IDS}`
 
 This model keeps the source tokenizer, chat template, generation config, and
-Apache-2.0 license metadata. It is not an official Talkie release.
+Apache-2.0 license metadata. It is not an official Talkie release. The ONNX
+artifacts validate outside the browser, and the smaller full-sequence q4f16 path
+has passed a Chrome/WebGPU smoke on a 24 GB M4 Pro. Cached KV-cache artifacts
+are published but still experimental in the browser.
 
 ## Quantization At A Glance
 
-The default browser artifact is **10.58 GB**, down from the **26.56 GB** BF16
-source weights: about **60% smaller** and **2.5x compressed**. The q8 fallback is
-**15.31 GB**, about **42% smaller** than the source.
+The preferred performance direction is the **cached q4f16 ONNX** file:
+**16.53 GB** across **32** external-data chunks. It is larger than the smaller
+full-sequence q4 artifact because the cached export intentionally leaves the
+key/value projections that build the KV cache unquantized, which keeps cached
+logits aligned with the source model while avoiding a full prompt re-run on
+every generated token.
 
 | Artifact | Size | Reduction vs source | Notes |
 | --- | ---: | ---: | --- |
 | BF16 source safetensors | 26.56&nbsp;GB | baseline | `{source_model}` |
-| q4f16 ONNX default | 10.58&nbsp;GB | 60% smaller | Nominal q4 weights; roughly 6.4 bits/parameter on disk |
-| q8 ONNX fallback | 15.31&nbsp;GB | 42% smaller | Roughly 9.2 bits/parameter on disk |
+| Cached q4f16 ONNX | 16.53&nbsp;GB | 38% smaller | Experimental KV-cache browser path; most MatMuls q4, K/V projections unquantized |
+| Cached q8 ONNX fallback | 21.60&nbsp;GB | 19% smaller | KV-cache fallback; K/V projections unquantized |
+| Full-sequence q4f16 fallback | 10.58&nbsp;GB | 60% smaller | Smaller download, slower generation |
+| Full-sequence q8 fallback | 15.31&nbsp;GB | 42% smaller | Full-prompt fallback path |
 
-The q4f16 file is larger than a theoretical pure 4-bit checkpoint because ONNX
-stores scales, metadata, and some unquantized tensors; this artifact also keeps
-runtime tensors in float32 where needed for WebGPU stability.
+The q4f16 files are larger than a theoretical pure 4-bit checkpoint because
+ONNX stores scales, metadata, and unquantized tensors. The cached files trade a
+larger first download for faster per-token decoding.
 
 ## Files
 
-| File | Runtime dtype | Use |
-| --- | --- | --- |
-| `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Default browser path, 10.58&nbsp;GB |
-| `onnx/model_quantized.onnx` | q8 | Fallback path, 15.31&nbsp;GB |
+| File | Runtime dtype | Use | External chunks |
+| --- | --- | --- | ---: |
+| `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Preferred cached browser path, 16.53&nbsp;GB | 32 |
+| `onnx/model_kv_quantized.onnx` | hybrid q8 | Cached fallback path, 21.60&nbsp;GB | 42 |
+| `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Full-sequence fallback, 10.58&nbsp;GB | 22 |
+| `onnx/model_quantized.onnx` | q8 | Full-sequence fallback, 15.31&nbsp;GB | 31 |
 
 The `config.json` includes the Transformers.js external-data chunk map used by
 the browser loader.
@@ -1331,15 +1936,17 @@ npm install
 npm run dev
 ```
 
-The app loads this repo with `device: "webgpu"` and `dtype: "{default_dtype}"`
-first, then falls back to `q8` if needed.
+The app defaults to the smaller full-sequence q4f16 artifact and exposes cached
+q4f16 as an explicit option. Cached q4f16 is the preferred performance direction
+because it avoids rerunning the full prompt every token, but it is still an
+experimental Chrome/WebGPU load path.
 
 ## Transformers.js Notes
 
 Talkie has a custom `model_type`, so stock `pipeline("text-generation")` is not
 used here. The browser runner formats messages with the shipped chat template,
-tokenizes them, runs the full accumulated `input_ids` for each new token, samples
-on the CPU, suppresses token `0`, and stops on token IDs `65535` or `65536`.
+tokenizes them, runs an explicit manual generation loop, samples on the CPU,
+suppresses token `0`, and stops on token IDs `65535` or `65536`.
 
 Minimal loading sketch:
 
@@ -1354,17 +1961,34 @@ const model = await AutoModel.from_pretrained(repo, {{
 }});
 ```
 
-Use the GitHub runner for the complete manual generation loop.
+Use the GitHub runner for the complete manual generation loop, including
+manual `past_key_values.*` cache management for the `model_kv*` files.
+
+## Validation
+
+- Hub artifact validation confirms tokenizer/config files, ONNX files, and all
+  q4/q8 external-data chunks.
+- The cached q4f16 artifact validated against the PyTorch full-sequence wrapper
+  on CUDA and CPU providers.
+- The cached q8 fallback validated against the same reference on the CPU
+  provider and is kept as a browser/WebGPU fallback.
+- Chromium on a 24 GB M4 Pro loaded full-sequence q4f16 with `cache=0` and ONNX
+  Runtime graph optimization disabled, then generated 16 non-NUL words at about
+  `0.61 tok/s`.
 
 ## Known Limitations
 
 - First load is large and slow because the model is split across external-data
   chunks.
-- Browser cache writes may hit quota; that is noisy but not necessarily fatal if
-  the model reaches `Ready`.
+- Browser cache writes are disabled by default to reduce duplicate large
+  allocations during cold load.
 - q4f16 keeps q4 weights but uses float32 runtime tensors in the current browser
   artifact for WebGPU stability.
-- Generation is full-sequence and intentionally slower than a KV-cache decoder.
+- The older `model_q4f16.onnx` and `model_quantized.onnx` files are
+  full-sequence fallbacks and are slower than the `model_kv*` cached files.
+- The default browser path is full-sequence q4f16, so generation is slow. The
+  latest local Chrome smoke measured about `0.61 tok/s` on an M4 Pro.
+- Cached KV-cache loading remains experimental in Chrome/WebGPU.
 
 ## Attribution
 
@@ -1376,39 +2000,89 @@ Talkie project at <https://github.com/talkie-lm/talkie>.
     (out_dir / "README.md").write_text(readme, encoding="utf-8")
 
 
-def quantize_q4_model(model, save_path: Path, block_size: int, accuracy_level: int | None):
-    try:
-        from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer
+KV_CACHE_Q4_UNQUANTIZED_WEIGHT_PATTERNS = (
+    ".attn.attn_query.weight",
+    ".attn.attn_key.weight",
+    ".attn.attn_value.weight",
+)
+KV_CACHE_Q8_UNQUANTIZED_WEIGHT_PATTERNS = (
+    ".attn.attn_key.weight",
+    ".attn.attn_value.weight",
+)
 
-        quantizer = MatMul4BitsQuantizer(
-            model=model,
-            block_size=block_size,
-            is_symmetric=True,
-            accuracy_level=accuracy_level,
-        )
-        quantizer.process()
-        return quantizer.model.model
-    except ModuleNotFoundError:
-        import onnxruntime.quantization.matmul_nbits_quantizer as nbits_quantizer
 
-        quant_config = nbits_quantizer.DefaultWeightOnlyQuantConfig(
-            block_size=block_size,
-            is_symmetric=True,
-            accuracy_level=accuracy_level,
-            quant_format=nbits_quantizer.QuantFormat.QOperator,
-            op_types_to_quantize=("MatMul", "Gather"),
-            quant_axes=(("MatMul", 0), ("Gather", 1)),
-            bits=4,
-        )
-        quantizer = nbits_quantizer.MatMulNBitsQuantizer(
-            model,
-            nodes_to_exclude=None,
-            nodes_to_include=None,
-            algo_config=quant_config,
-        )
-        quantizer.process()
-        quantized_model = getattr(quantizer.model, "model", quantizer.model)
-        return quantized_model
+ATTN_PROJECTION_PATTERNS = {
+    "query": ".attn.attn_query.weight",
+    "key": ".attn.attn_key.weight",
+    "value": ".attn.attn_value.weight",
+}
+
+
+def parse_projection_exclude_patterns(value: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    if value == "":
+        return ()
+    names = [item.strip() for item in value.split(",") if item.strip()]
+    if not names:
+        return default
+    unknown = sorted(set(names) - set(ATTN_PROJECTION_PATTERNS))
+    if unknown:
+        raise ValueError(f"Unknown attention projection name(s): {', '.join(unknown)}")
+    return tuple(ATTN_PROJECTION_PATTERNS[name] for name in names)
+
+
+def matmul_nodes_for_weight_patterns(model, patterns: tuple[str, ...]) -> list[str]:
+    initializers = {initializer.name for initializer in model.graph.initializer}
+    excluded: list[str] = []
+    for node in model.graph.node:
+        if node.op_type != "MatMul" or len(node.input) < 2 or node.input[1] not in initializers:
+            continue
+        if any(pattern in node.input[1] for pattern in patterns):
+            excluded.append(node.name)
+    return excluded
+
+
+def quantize_q4_model(
+    model,
+    save_path: Path,
+    block_size: int,
+    accuracy_level: int | None,
+    nodes_to_exclude: list[str] | None = None,
+):
+    if not nodes_to_exclude:
+        try:
+            from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer
+
+            quantizer = MatMul4BitsQuantizer(
+                model=model,
+                block_size=block_size,
+                is_symmetric=True,
+                accuracy_level=accuracy_level,
+            )
+            quantizer.process()
+            return quantizer.model.model
+        except ModuleNotFoundError:
+            pass
+
+    import onnxruntime.quantization.matmul_nbits_quantizer as nbits_quantizer
+
+    quant_config = nbits_quantizer.DefaultWeightOnlyQuantConfig(
+        block_size=block_size,
+        is_symmetric=True,
+        accuracy_level=accuracy_level,
+        quant_format=nbits_quantizer.QuantFormat.QOperator,
+        op_types_to_quantize=("MatMul", "Gather"),
+        quant_axes=(("MatMul", 0), ("Gather", 1)),
+        bits=4,
+    )
+    quantizer = nbits_quantizer.MatMulNBitsQuantizer(
+        model,
+        nodes_to_exclude=nodes_to_exclude or None,
+        nodes_to_include=None,
+        algo_config=quant_config,
+    )
+    quantizer.process()
+    quantized_model = getattr(quantizer.model, "model", quantizer.model)
+    return quantized_model
 
 
 def quantize_with_onnxruntime(
@@ -1418,7 +2092,11 @@ def quantize_with_onnxruntime(
     skip_q4: bool,
     skip_q8: bool,
     q4_final_fp16: bool,
+    quantize_kv_attention_projections: bool,
+    kv_q4_exclude_patterns: tuple[str, ...],
+    kv_q8_exclude_patterns: tuple[str, ...],
     q8_source_path: Path | None = None,
+    base_model_name: str = "model",
 ) -> None:
     import onnx
     from onnxconverter_common.float16 import convert_float_to_float16
@@ -1426,12 +2104,12 @@ def quantize_with_onnxruntime(
     from onnxruntime.quantization.onnx_quantizer import ONNXQuantizer
     from onnxruntime.quantization.registry import IntegerOpsRegistry
 
-    model_path = onnx_dir / "model.onnx"
-    q8_path = onnx_dir / "model_quantized.onnx"
-    q4_path = onnx_dir / "model_q4f16.onnx"
+    model_path = onnx_dir / f"{base_model_name}.onnx"
+    q8_path = onnx_dir / f"{base_model_name}_quantized.onnx"
+    q4_path = onnx_dir / f"{base_model_name}_q4f16.onnx"
 
     logging.getLogger("onnxruntime.quantization.matmul_4bits_quantizer").setLevel(logging.WARNING)
-    logging.getLogger("onnxruntime.quantization.matmul_nbits_quantizer").setLevel(logging.INFO)
+    logging.getLogger("onnxruntime.quantization.matmul_nbits_quantizer").setLevel(logging.WARNING)
 
     if skip_q4:
         print("Skipping q4f16 quantization.", flush=True)
@@ -1443,8 +2121,29 @@ def quantize_with_onnxruntime(
             print(json.dumps({"preprocess": "q4_bfloat16_to_float32", **q4_bf16_to_f32}, indent=2), flush=True)
             q4_folded_matmuls = fold_matmul_initializer_chains(q4_model, force_float16=False)
             print(json.dumps({"preprocess": "q4_fold_matmul_initializer_chains", "folded_matmuls": q4_folded_matmuls}, indent=2), flush=True)
+            q4_nodes_to_exclude = []
+            if base_model_name == "model_kv" and not quantize_kv_attention_projections:
+                q4_nodes_to_exclude = matmul_nodes_for_weight_patterns(q4_model, kv_q4_exclude_patterns)
+            if q4_nodes_to_exclude:
+                print(
+                    json.dumps(
+                        {
+                            "quantization": "q4_exclude_kv_cache_attention_projections",
+                            "excluded_nodes": len(q4_nodes_to_exclude),
+                            "sample": q4_nodes_to_exclude[:8],
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
         with heartbeat("q4_quantize"):
-            q4f16_model = quantize_q4_model(q4_model, q4_path, q4_block_size, q4_accuracy_level)
+            q4f16_model = quantize_q4_model(
+                q4_model,
+                q4_path,
+                q4_block_size,
+                q4_accuracy_level,
+                nodes_to_exclude=q4_nodes_to_exclude,
+            )
         if q4_final_fp16:
             try:
                 q4f16_model = convert_float_to_float16(q4f16_model, keep_io_types=True, disable_shape_infer=True)
@@ -1504,6 +2203,22 @@ def quantize_with_onnxruntime(
                 ),
                 flush=True,
             )
+        q8_nodes_to_exclude = []
+        if base_model_name == "model_kv" and not quantize_kv_attention_projections:
+            q8_nodes_to_exclude = matmul_nodes_for_weight_patterns(q8_model, kv_q8_exclude_patterns)
+        if q8_nodes_to_exclude:
+            print(
+                json.dumps(
+                    {
+                        "quantization": "q8_exclude_kv_cache_attention_projections",
+                        "excluded_nodes": len(q8_nodes_to_exclude),
+                        "sample": q8_nodes_to_exclude[:8],
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+    q8_op_types = {"MatMul"} if base_model_name == "model_kv" else set(IntegerOpsRegistry.keys())
     q8_quantizer = ONNXQuantizer(
         q8_model,
         per_channel=False,
@@ -1514,8 +2229,8 @@ def quantize_with_onnxruntime(
         activation_qType=QuantType.QUInt8,
         tensors_range=None,
         nodes_to_quantize=[],
-        nodes_to_exclude=[],
-        op_types_to_quantize=set(IntegerOpsRegistry.keys()),
+        nodes_to_exclude=q8_nodes_to_exclude,
+        op_types_to_quantize=q8_op_types,
         extra_options={"EnableSubgraph": True, "MatMulConstBOnly": True},
     )
     with heartbeat("q8_quantize"):
@@ -1559,12 +2274,31 @@ def prepare_q8_folded_model(onnx_dir: Path) -> None:
     gc.collect()
 
 
-def upload_to_hub(out_dir: Path, repo_id: str, private: bool, token: str, upload_fp_model: bool) -> None:
+def repair_quantized_runtime_types(onnx_path: Path) -> dict[str, int]:
+    return {
+        "aligned_inputs": align_saved_constant_types_for_elementwise_ops(onnx_path),
+        "inserted_matmul_casts": align_saved_quantized_matmul_types(onnx_path),
+        "inserted_regular_matmul_casts": align_saved_regular_matmul_types(onnx_path),
+        "inserted_concat_casts": align_saved_concat_runtime_types(onnx_path),
+        "inserted_elementwise_casts": align_saved_elementwise_runtime_types(onnx_path),
+        "stripped_value_info": strip_saved_value_info(onnx_path),
+        "renamed_duplicate_nodes": dedupe_saved_node_names(onnx_path),
+    }
+
+
+def upload_to_hub(
+    out_dir: Path,
+    repo_id: str,
+    private: bool,
+    token: str,
+    upload_fp_model: bool,
+    base_model_name: str,
+) -> None:
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
     allow_patterns = None
     delete_patterns = None
-    if not upload_fp_model:
+    if not upload_fp_model and base_model_name == "model":
         allow_patterns = [
             "README.md",
             *METADATA_FILES,
@@ -1574,14 +2308,77 @@ def upload_to_hub(out_dir: Path, repo_id: str, private: bool, token: str, upload
             "onnx/model_quantized.onnx_data*",
         ]
         delete_patterns = ["onnx/model.*", "onnx/model_fp16*"]
+    elif not upload_fp_model and base_model_name == "model_kv":
+        allow_patterns = [
+            "README.md",
+            *METADATA_FILES,
+            "onnx/model_kv_q4f16.onnx",
+            "onnx/model_kv_q4f16.onnx_data*",
+            "onnx/model_kv_quantized.onnx",
+            "onnx/model_kv_quantized.onnx_data*",
+        ]
+        delete_patterns = ["onnx/model_kv.onnx", "onnx/model_kv.onnx_data*", "onnx/model_kv_fp16*"]
+    elif not upload_fp_model and base_model_name == "browser":
+        allow_patterns = [
+            "README.md",
+            *METADATA_FILES,
+            "onnx/model_q4f16.onnx",
+            "onnx/model_q4f16.onnx_data*",
+            "onnx/model_quantized.onnx",
+            "onnx/model_quantized.onnx_data*",
+            "onnx/model_kv_q4f16.onnx",
+            "onnx/model_kv_q4f16.onnx_data*",
+            "onnx/model_kv_quantized.onnx",
+            "onnx/model_kv_quantized.onnx_data*",
+        ]
+        delete_patterns = ["onnx/model.onnx", "onnx/model.onnx_data*", "onnx/model_fp16*", "onnx/model_kv.onnx", "onnx/model_kv.onnx_data*", "onnx/model_kv_fp16*"]
     api.upload_folder(
         repo_id=repo_id,
         repo_type="model",
         folder_path=str(out_dir),
-        commit_message="Add Talkie ONNX WebGPU export",
+        commit_message="Add Talkie KV-cache ONNX WebGPU export" if base_model_name == "model_kv" else "Add Talkie ONNX WebGPU export",
         allow_patterns=allow_patterns,
         delete_patterns=delete_patterns,
     )
+    prune_stale_external_data_chunks(api, repo_id, out_dir, base_model_name)
+
+
+def upload_model_names(base_model_name: str, upload_fp_model: bool) -> tuple[str, ...]:
+    if upload_fp_model:
+        return ()
+    if base_model_name == "model":
+        return FULL_SEQUENCE_ONNX_FILES
+    if base_model_name == "model_kv":
+        return KV_CACHE_ONNX_FILES
+    if base_model_name == "browser":
+        return BROWSER_ONNX_FILES
+    return ()
+
+
+def prune_stale_external_data_chunks(api: HfApi, repo_id: str, out_dir: Path, base_model_name: str) -> None:
+    model_names = upload_model_names(base_model_name, upload_fp_model=False)
+    if not model_names:
+        return
+    onnx_dir = out_dir / "onnx"
+    expected_paths: set[str] = set()
+    for model_name in model_names:
+        expected_paths.update(f"onnx/{path.name}" for path in onnx_dir.glob(f"{model_name}_data*"))
+    if not expected_paths:
+        return
+    remote_files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+    stale_paths = sorted(
+        path
+        for path in remote_files
+        if any(path == f"onnx/{name}_data" or path.startswith(f"onnx/{name}_data_") for name in model_names)
+        and path not in expected_paths
+    )
+    if stale_paths:
+        api.delete_files(
+            repo_id=repo_id,
+            repo_type="model",
+            delete_patterns=stale_paths,
+            commit_message="Remove stale Talkie ONNX sidecar chunks",
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1599,8 +2396,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--q4-block-size", type=int, default=32)
     parser.add_argument("--q4-accuracy-level", type=int, default=4)
     parser.add_argument("--q4-final-fp16", action="store_true", help="Convert the q4 graph runtime tensors to fp16 after quantization")
+    parser.add_argument(
+        "--quantize-kv-attention-projections",
+        action="store_true",
+        help="Also quantize KV-cache q/k/v attention projections to reduce browser download size.",
+    )
+    parser.add_argument(
+        "--kv-q4-exclude-attn-projections",
+        default="query,key,value",
+        help="Comma-separated KV-cache attention projections to keep unquantized for q4: query,key,value.",
+    )
+    parser.add_argument(
+        "--kv-q8-exclude-attn-projections",
+        default="key,value",
+        help="Comma-separated KV-cache attention projections to keep unquantized for q8: query,key,value.",
+    )
     parser.add_argument("--skip-export", action="store_true")
     parser.add_argument("--skip-quantize", action="store_true")
+    parser.add_argument(
+        "--split-only",
+        action="store_true",
+        help="Only resplit existing browser ONNX external-data files, update config, and upload",
+    )
+    parser.add_argument(
+        "--validate-existing-quantized",
+        action="store_true",
+        help="Validate existing quantized artifacts without re-running quantization",
+    )
+    parser.add_argument(
+        "--repair-existing-quantized",
+        action="store_true",
+        help="Re-run saved quantized ONNX runtime type repair passes before validation/upload",
+    )
     parser.add_argument("--skip-q4", action="store_true", help="Skip q4f16 generation; useful for q8 recovery runs")
     parser.add_argument("--skip-q8", action="store_true", help="Only produce q4f16; useful for recovery runs")
     parser.add_argument("--skip-upload", action="store_true")
@@ -1610,6 +2437,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-q8-fp16", action="store_true", help="Write onnx/model_fp16.onnx and exit")
     parser.add_argument("--prepare-q8-folded", action="store_true", help="Write onnx/model_fp16_folded.onnx and exit")
     parser.add_argument("--q8-source-path", default=None, help="Use a preprocessed ONNX source for q8 quantization")
+    parser.add_argument("--kv-cache", action="store_true", help="Export model_kv*.onnx with past/present KV-cache tensors")
+    parser.add_argument("--kv-export-past-len", type=int, default=1, help="Dummy past length used when tracing the KV-cache graph")
     parser.add_argument(
         "--split-external-data",
         dest="split_external_data",
@@ -1648,7 +2477,8 @@ def main() -> None:
     work_dir = Path(args.work_dir)
     out_dir = work_dir / "hub"
     onnx_dir = out_dir / "onnx"
-    model_path = onnx_dir / "model.onnx"
+    base_model_name = "model_kv" if args.kv_cache else "model"
+    model_path = onnx_dir / f"{base_model_name}.onnx"
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1663,6 +2493,8 @@ def main() -> None:
                 "export_compute_dtype": args.export_compute_dtype,
                 "q4_block_size": args.q4_block_size,
                 "q4_accuracy_level": args.q4_accuracy_level,
+                "kv_cache": args.kv_cache,
+                "base_model_name": base_model_name,
                 "work_dir": str(work_dir),
             },
             indent=2,
@@ -1670,13 +2502,35 @@ def main() -> None:
         flush=True,
     )
 
+    if args.split_only:
+        copy_metadata(args.model_id, args.revision, out_dir, token)
+        write_model_card(out_dir, args.model_id, args.revision, default_dtype="q4f16")
+        external_data_chunks = split_browser_external_data(onnx_dir, args.external_data_chunk_mib)
+        if external_data_chunks:
+            update_transformers_js_config(out_dir, external_data_chunks)
+        if not args.skip_upload:
+            upload_to_hub(
+                out_dir,
+                args.output_repo,
+                args.private,
+                token,
+                upload_fp_model=args.upload_fp_model,
+                base_model_name="browser",
+            )
+        print("DONE", flush=True)
+        return
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, revision=args.revision, token=token, trust_remote_code=True)
     input_ids = prepare_prompt(tokenizer, args.prompt)
     reference_top5: list[int] | None = None
+    kv_spec: KvCacheSpec | None = None
+    torch_dtype = resolve_torch_dtype(args.torch_dtype)
+    export_compute_dtype = resolve_export_compute_dtype(args.export_compute_dtype, torch_dtype)
+    if args.kv_cache and args.export_compute_dtype == "source":
+        export_compute_dtype = torch.float32
+    fold_export_casts = export_compute_dtype in (torch.float32, torch.float16)
 
     if not args.skip_export:
-        torch_dtype = resolve_torch_dtype(args.torch_dtype)
-        export_compute_dtype = resolve_export_compute_dtype(args.export_compute_dtype, torch_dtype)
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             revision=args.revision,
@@ -1685,47 +2539,74 @@ def main() -> None:
             dtype=torch_dtype,
         ).to("cuda")
         model.eval()
-        wrapper = TalkieFullSequenceOnnxWrapper(model, args.max_seq_len, compute_dtype=export_compute_dtype).eval().to("cuda")
+        full_wrapper = TalkieFullSequenceOnnxWrapper(model, args.max_seq_len, compute_dtype=export_compute_dtype).eval().to("cuda")
         input_ids = input_ids.to("cuda")
-        validate_wrapper_against_model(model, wrapper, input_ids)
+        validate_wrapper_against_model(model, full_wrapper, input_ids)
 
-        try:
-            export_onnx(
+        if args.kv_cache:
+            wrapper = TalkieKvCacheOnnxWrapper(model, args.max_seq_len, compute_dtype=export_compute_dtype).eval().to("cuda")
+            kv_spec = kv_cache_spec_from_wrapper(wrapper)
+            validate_kv_wrapper_against_full_wrapper(full_wrapper, wrapper, input_ids)
+            export_kv_onnx(
                 wrapper,
                 input_ids,
                 model_path,
                 args.opset,
-                dynamo=not args.legacy_export,
                 max_seq_len=args.max_seq_len,
+                export_past_len=args.kv_export_past_len,
             )
-        except Exception:
-            if args.legacy_export:
-                raise
-            print("Dynamo export failed; retrying with legacy exporter.", file=sys.stderr, flush=True)
-            export_onnx(wrapper, input_ids, model_path, args.opset, dynamo=False, max_seq_len=args.max_seq_len)
+            reference_top5 = reference_top5_from_kv_wrapper(wrapper, input_ids)
+        else:
+            wrapper = full_wrapper
+            try:
+                export_onnx(
+                    wrapper,
+                    input_ids,
+                    model_path,
+                    args.opset,
+                    dynamo=not args.legacy_export,
+                    max_seq_len=args.max_seq_len,
+                )
+            except Exception:
+                if args.legacy_export:
+                    raise
+                print("Dynamo export failed; retrying with legacy exporter.", file=sys.stderr, flush=True)
+                export_onnx(wrapper, input_ids, model_path, args.opset, dynamo=False, max_seq_len=args.max_seq_len)
 
-        reference_top5 = reference_top5_from_wrapper(wrapper, input_ids)
+            reference_top5 = reference_top5_from_wrapper(wrapper, input_ids)
         del model
+        del full_wrapper
         del wrapper
         release_cuda_memory()
-        preprocess_onnx_for_quantization(model_path, fold_casts=args.export_compute_dtype == "float16")
+        preprocess_onnx_for_quantization(model_path, fold_casts=fold_export_casts)
         summarize_onnx_graph(model_path)
         if not args.skip_fp_validation:
-            result = validate_onnx(
-                model_path,
-                input_ids.cpu(),
-                "fp_export",
-                reference_top5=reference_top5,
-                require_top1_match=True,
-            )
+            if args.kv_cache:
+                if kv_spec is None:
+                    raise RuntimeError("kv_spec is required for KV-cache validation")
+                result = validate_kv_onnx(
+                    model_path,
+                    kv_spec=kv_spec,
+                    input_ids=input_ids.cpu(),
+                    name="fp_export_kv",
+                    reference_top5=reference_top5,
+                    require_top1_match=True,
+                )
+            else:
+                result = validate_onnx(
+                    model_path,
+                    input_ids.cpu(),
+                    "fp_export",
+                    reference_top5=reference_top5,
+                    require_top1_match=True,
+                )
             if not result.passed:
                 raise RuntimeError("ONNX export validation failed")
     else:
-        if not model_path.exists():
+        model_path_exists = model_path.exists()
+        if not model_path_exists and not (args.validate_existing_quantized or args.repair_existing_quantized):
             raise FileNotFoundError(model_path)
         if not (args.skip_fp_validation and args.skip_quant_validation):
-            torch_dtype = resolve_torch_dtype(args.torch_dtype)
-            export_compute_dtype = resolve_export_compute_dtype(args.export_compute_dtype, torch_dtype)
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_id,
                 revision=args.revision,
@@ -1733,23 +2614,46 @@ def main() -> None:
                 trust_remote_code=True,
                 dtype=torch_dtype,
             ).to("cuda")
-            wrapper = TalkieFullSequenceOnnxWrapper(model.eval(), args.max_seq_len, compute_dtype=export_compute_dtype).eval().to("cuda")
-            reference_top5 = reference_top5_from_wrapper(wrapper, input_ids)
+            full_wrapper = TalkieFullSequenceOnnxWrapper(model.eval(), args.max_seq_len, compute_dtype=export_compute_dtype).eval().to("cuda")
+            if args.kv_cache:
+                wrapper = TalkieKvCacheOnnxWrapper(model.eval(), args.max_seq_len, compute_dtype=export_compute_dtype).eval().to("cuda")
+                kv_spec = kv_cache_spec_from_wrapper(wrapper)
+                validate_kv_wrapper_against_full_wrapper(full_wrapper, wrapper, input_ids)
+                reference_top5 = reference_top5_from_kv_wrapper(wrapper, input_ids)
+            else:
+                wrapper = full_wrapper
+                reference_top5 = reference_top5_from_wrapper(wrapper, input_ids)
             del model
+            del full_wrapper
             del wrapper
             release_cuda_memory()
-        preprocess_onnx_for_quantization(model_path, fold_casts=args.export_compute_dtype == "float16")
-        summarize_onnx_graph(model_path)
+        if model_path_exists:
+            preprocess_onnx_for_quantization(model_path, fold_casts=fold_export_casts)
+            summarize_onnx_graph(model_path)
+        elif not args.skip_fp_validation:
+            raise FileNotFoundError(model_path)
         if not args.skip_fp_validation:
             if reference_top5 is None:
                 raise RuntimeError("reference_top5 is required for fp validation")
-            result = validate_onnx(
-                model_path,
-                input_ids.cpu(),
-                "fp_export",
-                reference_top5=reference_top5,
-                require_top1_match=True,
-            )
+            if args.kv_cache:
+                if kv_spec is None:
+                    raise RuntimeError("kv_spec is required for KV-cache validation")
+                result = validate_kv_onnx(
+                    model_path,
+                    kv_spec,
+                    input_ids.cpu(),
+                    "fp_export_kv",
+                    reference_top5=reference_top5,
+                    require_top1_match=True,
+                )
+            else:
+                result = validate_onnx(
+                    model_path,
+                    input_ids.cpu(),
+                    "fp_export",
+                    reference_top5=reference_top5,
+                    require_top1_match=True,
+                )
             if not result.passed:
                 raise RuntimeError("ONNX export validation failed")
 
@@ -1766,7 +2670,9 @@ def main() -> None:
         print("DONE", flush=True)
         return
 
-    if not args.skip_quantize:
+    if args.validate_existing_quantized:
+        print("Validating existing quantized ONNX artifacts without re-running quantization.", flush=True)
+    elif not args.skip_quantize:
         quantize_with_onnxruntime(
             onnx_dir,
             q4_block_size=args.q4_block_size,
@@ -1774,10 +2680,30 @@ def main() -> None:
             skip_q4=args.skip_q4,
             skip_q8=args.skip_q8,
             q4_final_fp16=args.q4_final_fp16,
+            quantize_kv_attention_projections=args.quantize_kv_attention_projections,
+            kv_q4_exclude_patterns=parse_projection_exclude_patterns(
+                args.kv_q4_exclude_attn_projections,
+                KV_CACHE_Q4_UNQUANTIZED_WEIGHT_PATTERNS,
+            ),
+            kv_q8_exclude_patterns=parse_projection_exclude_patterns(
+                args.kv_q8_exclude_attn_projections,
+                KV_CACHE_Q8_UNQUANTIZED_WEIGHT_PATTERNS,
+            ),
             q8_source_path=Path(args.q8_source_path) if args.q8_source_path else None,
+            base_model_name=base_model_name,
         )
-        q4_path = onnx_dir / "model_q4f16.onnx"
-        q8_path = onnx_dir / "model_quantized.onnx"
+
+    if args.repair_existing_quantized:
+        repair_targets = [onnx_dir / f"{base_model_name}_q4f16.onnx"]
+        if not args.skip_q8:
+            repair_targets.append(onnx_dir / f"{base_model_name}_quantized.onnx")
+        for repaired_path in repair_targets:
+            if repaired_path.exists():
+                print(json.dumps({"repair": str(repaired_path), **repair_quantized_runtime_types(repaired_path)}, indent=2), flush=True)
+
+    if args.validate_existing_quantized or not args.skip_quantize:
+        q4_path = onnx_dir / f"{base_model_name}_q4f16.onnx"
+        q8_path = onnx_dir / f"{base_model_name}_quantized.onnx"
         if args.skip_quant_validation:
             print("Skipping quantized ONNX validation.", flush=True)
         elif args.skip_q4:
@@ -1785,25 +2711,50 @@ def main() -> None:
         elif q4_path.exists():
             if reference_top5 is None:
                 raise RuntimeError("reference_top5 is required for quantized validation")
-            q4_result = validate_onnx(
-                q4_path,
-                input_ids.cpu(),
-                "q4f16",
-                reference_top5=reference_top5,
-                require_top1_match=False,
-            )
+            if args.kv_cache:
+                if kv_spec is None:
+                    raise RuntimeError("kv_spec is required for KV-cache validation")
+                q4_result = validate_kv_onnx(
+                    q4_path,
+                    kv_spec,
+                    input_ids.cpu(),
+                    "q4f16_kv",
+                    reference_top5=reference_top5,
+                    require_top1_match=False,
+                )
+            else:
+                q4_result = validate_onnx(
+                    q4_path,
+                    input_ids.cpu(),
+                    "q4f16",
+                    reference_top5=reference_top5,
+                    require_top1_match=False,
+                )
             if not q4_result.passed:
                 raise RuntimeError("q4f16 validation failed")
         if args.skip_quant_validation:
             pass
         elif q8_path.exists():
-            q8_result = validate_onnx(
-                q8_path,
-                input_ids.cpu(),
-                "q8",
-                reference_top5=reference_top5,
-                require_top1_match=False,
-            )
+            if args.kv_cache:
+                if kv_spec is None:
+                    raise RuntimeError("kv_spec is required for KV-cache validation")
+                q8_result = validate_kv_onnx(
+                    q8_path,
+                    kv_spec,
+                    input_ids.cpu(),
+                    "q8_kv_cpu",
+                    reference_top5=reference_top5,
+                    require_top1_match=False,
+                    providers=["CPUExecutionProvider"],
+                )
+            else:
+                q8_result = validate_onnx(
+                    q8_path,
+                    input_ids.cpu(),
+                    "q8",
+                    reference_top5=reference_top5,
+                    require_top1_match=False,
+                )
             if not q8_result.passed:
                 raise RuntimeError("q8 validation failed")
         elif args.skip_q8:
@@ -1817,7 +2768,14 @@ def main() -> None:
             update_transformers_js_config(out_dir, external_data_chunks)
 
     if not args.skip_upload:
-        upload_to_hub(out_dir, args.output_repo, args.private, token, upload_fp_model=args.upload_fp_model)
+        upload_to_hub(
+            out_dir,
+            args.output_repo,
+            args.private,
+            token,
+            upload_fp_model=args.upload_fp_model,
+            base_model_name=base_model_name,
+        )
 
     print("DONE", flush=True)
 

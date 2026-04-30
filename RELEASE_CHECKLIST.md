@@ -7,12 +7,18 @@ Use this checklist before publishing or tagging the repo.
 - GitHub repo: `scasella/talkie-quant-webgpu`
 - Live demo: `https://scasella.github.io/talkie-quant-webgpu/`
 - Hub repo: `scasella91/talkie-1930-13b-it-ONNX`
-- Validated ONNX artifact commit: `addb95a08622583a3017576e9442a9d6853e88c1`
+- Validated ONNX artifact commit: `8353531db9d507d96b8a92f5aceb12ff71b6b753`
 - Browser default: `onnx/model_q4f16.onnx`
-- q4 external-data chunks: `10`
-- q8 fallback: `onnx/model_quantized.onnx`
-- q8 external-data chunks: `15`
-- Smoke prompt target: at least `16` streamed non-NUL tokens over WebGPU
+- Cached q4 artifact: `onnx/model_kv_q4f16.onnx`, `32` chunks, `16.53 GB`
+- Cached q8 fallback: `onnx/model_kv_quantized.onnx`
+- Cached q8 external-data chunks: `42` chunks, `21.60 GB`
+- Full-sequence q4 fallback: `onnx/model_q4f16.onnx`, `22` chunks
+- Full-sequence q8 fallback: `onnx/model_quantized.onnx`, `31` chunks
+- Smoke prompt target: at least `16` streamed non-NUL words over WebGPU
+- Current browser gate: passed in Chromium on a 24 GB M4 Pro using
+  full-sequence q4f16, `cache=0`, and ONNX Runtime graph optimization disabled.
+  Evidence: load reached `Ready` in about 8 minutes and generated 16 non-NUL
+  words at about `0.61 tok/s`.
 
 ## Required Checks
 
@@ -20,7 +26,7 @@ Use this checklist before publishing or tagging the repo.
 npm run build
 npm run build:pages
 python3 -m py_compile scripts/*.py
-python3 scripts/check_hub_artifacts.py scasella91/talkie-1930-13b-it-ONNX
+python3 scripts/check_hub_artifacts.py --require-kv scasella91/talkie-1930-13b-it-ONNX
 TALKIE_WEB_URL=https://scasella.github.io/talkie-quant-webgpu/ TALKIE_WEB_EXPECTED_DTYPE=q4f16 TALKIE_WEB_MIN_TOKENS=16 python3 scripts/validate_browser_webgpu.py
 ```
 

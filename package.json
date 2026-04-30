@@ -31,6 +31,8 @@
     "build": "tsc && vite build",
     "build:pages": "VITE_BASE_PATH=/talkie-quant-webgpu/ npm run build",
     "preview": "vite preview --host 127.0.0.1",
+    "diagnose:browser": "node scripts/diagnose_browser_load.mjs",
+    "diagnose:ort": "node scripts/diagnose_ort_direct.mjs",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
@@ -43,6 +45,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",
+    "playwright": "^1.59.1",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
   }
