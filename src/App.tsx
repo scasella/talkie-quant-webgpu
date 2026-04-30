@@ -16,6 +16,7 @@ import {
   GenerationStats,
   LoadPath,
   LoadProgress,
+  RuntimeBackend,
   RuntimeMode,
   browserCacheEnabled,
   generateTalkieReply,
@@ -94,6 +95,7 @@ function App() {
   const [loadMeter, setLoadMeter] = useState<LoadMeter>(DEFAULT_LOAD_METER);
   const [dtype, setDtype] = useState("unloaded");
   const [runtimeMode, setRuntimeMode] = useState<RuntimeMode | "not loaded">("not loaded");
+  const [runtimeBackend, setRuntimeBackend] = useState<RuntimeBackend | "not loaded">("not loaded");
   const [tokenRate, setTokenRate] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -110,13 +112,16 @@ function App() {
   };
   const handleGenerationStats = (stats: GenerationStats) => {
     setRuntimeMode(stats.mode);
+    setRuntimeBackend(stats.backend);
     setTokenRate(stats.tokensPerSecond);
   };
 
   const loadModel = async () => {
+    const started = performance.now();
     setError(null);
     setLoading(true);
     setStatus("Loading");
+    recordUiMetric("load-start", { loadPath });
     loadFilesRef.current.clear();
     loadTargetRef.current = null;
     bestLoadPercentRef.current = 0;
@@ -129,20 +134,30 @@ function App() {
       const runtime = await loadTalkieRuntime(handleProgress, loadPath);
       setDtype(runtime.session.dtype);
       setRuntimeMode(runtime.session.mode);
+      setRuntimeBackend(runtime.session.backend);
       setStatus("Ready");
       setLoadMeter({
         label: "Ready",
-        detail: `Loaded ${runtime.session.dtype} ${runtime.session.mode}`,
+        detail: `Loaded ${runtime.session.dtype} ${runtime.session.mode} ${runtime.session.backend}`,
         percent: 100
       });
+      recordUiMetric("load-ready", {
+        loadPath,
+        dtype: runtime.session.dtype,
+        mode: runtime.session.mode,
+        backend: runtime.session.backend,
+        loadMs: performance.now() - started
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
       setStatus("Error");
       setLoadMeter({
         label: "Load failed",
         detail: "See error message",
         percent: null
       });
+      recordUiMetric("load-error", { loadPath, loadMs: performance.now() - started, error: message });
     } finally {
       setLoading(false);
     }
@@ -160,6 +175,7 @@ function App() {
       await resetTalkieRuntime();
       setDtype("unloaded");
       setRuntimeMode("not loaded");
+      setRuntimeBackend("not loaded");
       setTokenRate(null);
       loadFilesRef.current.clear();
       loadTargetRef.current = null;
@@ -198,6 +214,7 @@ function App() {
     setGenerating(true);
     setStatus("Thinking");
     setTokenRate(null);
+    recordUiMetric("generation-start", { promptLength: prompt.length, maxNewTokens: settings.maxNewTokens });
 
     const nextMessages: ChatMessage[] = [...messages, { role: "user", content: prompt }, { role: "assistant", content: "" }];
     setMessages(nextMessages);
@@ -218,10 +235,12 @@ function App() {
         handleGenerationStats
       );
       setStatus(controller.signal.aborted ? "Stopped" : "Ready");
+      recordUiMetric(controller.signal.aborted ? "generation-stopped" : "generation-ready", {});
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStatus("Error");
       setMessages((current) => current.slice(0, -1));
+      recordUiMetric("generation-error", { error: err instanceof Error ? err.message : String(err) });
     } finally {
       abortRef.current = null;
       setGenerating(false);
@@ -246,6 +265,7 @@ function App() {
               {dtype}
             </span>
             <span className="status">{runtimeMode}</span>
+            <span className="status">{runtimeBackend}</span>
             <span className="status">{tokenRate == null ? "tok/s --" : `${tokenRate.toFixed(2)} tok/s`}</span>
             <span className="status">cache {browserCacheEnabled() ? "on" : "off"}</span>
             <span className="status">{status}</span>
@@ -274,8 +294,8 @@ function App() {
                 onChange={(event) => setLoadPath(event.currentTarget.value as LoadPath)}
                 disabled={loading || generating}
               >
-                <option value="full">Smaller q4f16</option>
                 <option value="cached">Cached q4f16</option>
+                <option value="full">Smaller q4f16</option>
               </select>
             </label>
 
@@ -463,7 +483,22 @@ function sentenceCase(value: string): string {
 
 function defaultLoadPath(): LoadPath {
   if (typeof window === "undefined") return "full";
-  return new URLSearchParams(window.location.search).get("path") === "cached" ? "cached" : "full";
+  const params = new URLSearchParams(window.location.search);
+  const urlPath = params.get("path");
+  if (urlPath === "cached" || urlPath === "full") return urlPath;
+  return import.meta.env.VITE_TALKIE_LOAD_PATH === "full" ? "full" : "cached";
+}
+
+function recordUiMetric(kind: string, detail: Record<string, unknown>): void {
+  const target = window as Window & {
+    __talkieMetrics?: {
+      events?: Array<Record<string, unknown>>;
+      generation?: GenerationStats[];
+    };
+  };
+  target.__talkieMetrics ??= { generation: [] };
+  target.__talkieMetrics.events ??= [];
+  target.__talkieMetrics.events.push({ kind, timeMs: performance.now(), ...detail });
 }
 
 export default App;

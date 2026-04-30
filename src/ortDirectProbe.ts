@@ -1,7 +1,9 @@
 import * as ort from "onnxruntime-web/webgpu";
+import { registerTalkieFetchRetry, waitForTalkieFetchRetry } from "./fetchRetry";
+import { installTalkieFetchLimiter } from "./fetchLimiter";
 
 const DEFAULT_REPO = "scasella91/talkie-1930-13b-it-ONNX";
-const DEFAULT_REVISION = "8353531db9d507d96b8a92f5aceb12ff71b6b753";
+const DEFAULT_REVISION = "631cbea56319f30469aae41af8fbd3078c460b3b";
 const DEFAULT_FILE = "model_q4f16.onnx";
 const DEFAULT_CHUNKS: Record<string, number> = {
   "model_kv_q4f16.onnx": 32,
@@ -29,6 +31,8 @@ ort.env.wasm.wasmPaths = {
 setText("model", `${repo}@${revision}/onnx/${file}`);
 setText("ep", `${executionProvider}, wasm threads ${threads}, opt ${graphOptimizationLevel}`);
 setText("chunks", String(chunkCount));
+installTalkieFetchLimiter();
+registerTalkieFetchRetry();
 
 void run();
 
@@ -36,6 +40,7 @@ async function run() {
   try {
     setStatus("checking WebGPU");
     await reportGpuLimits();
+    await waitForTalkieFetchRetry();
 
     const modelUrl = hubUrl(file);
     const externalData = externalDataNames(file, chunkCount).map((name) => ({

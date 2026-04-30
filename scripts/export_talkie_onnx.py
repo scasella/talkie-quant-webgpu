@@ -34,7 +34,8 @@ STOP_TOKEN_IDS = [65535, 65536]
 DEFAULT_EXTERNAL_DATA_CHUNK_MIB = 512
 FULL_SEQUENCE_ONNX_FILES = ("model_q4f16.onnx", "model_quantized.onnx")
 KV_CACHE_ONNX_FILES = ("model_kv_q4f16.onnx", "model_kv_quantized.onnx")
-BROWSER_ONNX_FILES = (*FULL_SEQUENCE_ONNX_FILES, *KV_CACHE_ONNX_FILES)
+FAST_KV_CACHE_ONNX_FILES = ("model_kv_fast_q4f16.onnx", "model_kv_fast_quantized.onnx")
+BROWSER_ONNX_FILES = (*FULL_SEQUENCE_ONNX_FILES, *KV_CACHE_ONNX_FILES, *FAST_KV_CACHE_ONNX_FILES)
 METADATA_FILES = [
     "config.json",
     "tokenizer.json",
@@ -1820,6 +1821,35 @@ def update_transformers_js_config(out_dir: Path, external_data_chunks: dict[str,
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
+def merge_remote_transformers_js_config(out_dir: Path, repo_id: str, token: str) -> None:
+    config_path = out_dir / "config.json"
+    local_config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    try:
+        remote_path = hf_hub_download(
+            repo_id=repo_id,
+            filename="config.json",
+            repo_type="model",
+            token=token,
+        )
+        with open(remote_path, encoding="utf-8") as handle:
+            remote_config = json.load(handle)
+    except Exception:
+        remote_config = {}
+
+    remote_transformers_js = remote_config.setdefault("transformers.js_config", {})
+    local_transformers_js = local_config.get("transformers.js_config") or {}
+    remote_external = remote_transformers_js.get("use_external_data_format")
+    if not isinstance(remote_external, dict):
+        remote_external = {}
+    local_external = local_transformers_js.get("use_external_data_format")
+    if not isinstance(local_external, dict):
+        local_external = {}
+
+    remote_transformers_js["dtype"] = local_transformers_js.get("dtype") or remote_transformers_js.get("dtype") or "q4f16"
+    remote_transformers_js["use_external_data_format"] = {**remote_external, **local_external}
+    config_path.write_text(json.dumps(remote_config, indent=2) + "\n", encoding="utf-8")
+
+
 def copy_metadata(model_id: str, revision: str, out_dir: Path, token: str) -> None:
     snapshot_dir = snapshot_download(
         repo_id=model_id,
@@ -1882,36 +1912,36 @@ with Transformers.js.
 
 This model keeps the source tokenizer, chat template, generation config, and
 Apache-2.0 license metadata. It is not an official Talkie release. The ONNX
-artifacts validate outside the browser, and the smaller full-sequence q4f16 path
-has passed a Chrome/WebGPU smoke on a 24 GB M4 Pro. Cached KV-cache artifacts
-are published but still experimental in the browser.
+artifacts validate outside the browser. The fast cached q4f16 path has also
+passed a Chrome/WebGPU smoke on a 24 GB M4 Pro with direct ONNX Runtime WebGPU.
 
 ## Quantization At A Glance
 
-The preferred performance direction is the **cached q4f16 ONNX** file:
-**16.53 GB** across **32** external-data chunks. It is larger than the smaller
-full-sequence q4 artifact because the cached export intentionally leaves the
-key/value projections that build the KV cache unquantized, which keeps cached
-logits aligned with the source model while avoiding a full prompt re-run on
-every generated token.
+The default browser artifact is the **fast cached q4f16 ONNX** file: about
+**13.0 GB** across **55** smaller external-data chunks. It quantizes query/key
+attention projections while leaving value projections unquantized, preserving
+top-1 agreement on the smoke prompt and avoiding a full prompt re-run on every
+generated token.
 
 | Artifact | Size | Reduction vs source | Notes |
 | --- | ---: | ---: | --- |
 | BF16 source safetensors | 26.56&nbsp;GB | baseline | `{source_model}` |
-| Cached q4f16 ONNX | 16.53&nbsp;GB | 38% smaller | Experimental KV-cache browser path; most MatMuls q4, K/V projections unquantized |
+| Fast cached q4f16 ONNX default | 13.0&nbsp;GB | 51% smaller | Direct ORT KV-cache browser path; q/k quantized, value unquantized |
+| Cached q4f16 ONNX fallback | 16.53&nbsp;GB | 38% smaller | KV-cache fallback; q/k/v projections unquantized |
 | Cached q8 ONNX fallback | 21.60&nbsp;GB | 19% smaller | KV-cache fallback; K/V projections unquantized |
 | Full-sequence q4f16 fallback | 10.58&nbsp;GB | 60% smaller | Smaller download, slower generation |
 | Full-sequence q8 fallback | 15.31&nbsp;GB | 42% smaller | Full-prompt fallback path |
 
 The q4f16 files are larger than a theoretical pure 4-bit checkpoint because
-ONNX stores scales, metadata, and unquantized tensors. The cached files trade a
-larger first download for faster per-token decoding.
+ONNX stores scales, metadata, and unquantized tensors. The cached files trade
+first-load size for faster steady per-token decoding.
 
 ## Files
 
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |
-| `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Preferred cached browser path, 16.53&nbsp;GB | 32 |
+| `onnx/model_kv_fast_q4f16.onnx` | hybrid q4f16 | Default direct ORT cached browser path, about 13.0&nbsp;GB | 55 |
+| `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Conservative cached fallback, 16.53&nbsp;GB | 32 |
 | `onnx/model_kv_quantized.onnx` | hybrid q8 | Cached fallback path, 21.60&nbsp;GB | 42 |
 | `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Full-sequence fallback, 10.58&nbsp;GB | 22 |
 | `onnx/model_quantized.onnx` | q8 | Full-sequence fallback, 15.31&nbsp;GB | 31 |
@@ -1936,10 +1966,8 @@ npm install
 npm run dev
 ```
 
-The app defaults to the smaller full-sequence q4f16 artifact and exposes cached
-q4f16 as an explicit option. Cached q4f16 is the preferred performance direction
-because it avoids rerunning the full prompt every token, but it is still an
-experimental Chrome/WebGPU load path.
+The app defaults to cached q4f16. The smaller full-sequence q4f16 artifact
+remains available as a fallback.
 
 ## Transformers.js Notes
 
@@ -1961,20 +1989,24 @@ const model = await AutoModel.from_pretrained(repo, {{
 }});
 ```
 
-Use the GitHub runner for the complete manual generation loop, including
-manual `past_key_values.*` cache management for the `model_kv*` files.
+Use the GitHub runner for the complete manual generation loop, including direct
+ONNX Runtime loading, limited concurrent model fetches, and manual
+`past_key_values.*` cache management for the cached files.
 
 ## Validation
 
 - Hub artifact validation confirms tokenizer/config files, ONNX files, and all
-  q4/q8 external-data chunks.
-- The cached q4f16 artifact validated against the PyTorch full-sequence wrapper
-  on CUDA and CPU providers.
+  q4/q8 external-data chunks, including the additive fast cached q4 artifact.
+- The additive fast cached q4f16 artifact validated top-1 against the PyTorch
+  full-sequence wrapper with value projection left unquantized.
 - The cached q8 fallback validated against the same reference on the CPU
   provider and is kept as a browser/WebGPU fallback.
-- Chromium on a 24 GB M4 Pro loaded full-sequence q4f16 with `cache=0` and ONNX
-  Runtime graph optimization disabled, then generated 16 non-NUL words at about
-  `0.61 tok/s`.
+- Chromium on a 24 GB M4 Pro loaded cached q4f16 with `cache=0`,
+  `opt=disabled`, and `fetches=6`, then generated 16 non-NUL words with
+  `kv-cache` / `ort-direct`, about `3.17 tok/s` reported rolling latency, and
+  about `3.11 tok/s` p50 token latency.
+- Cold load remains slow: the measured run took about `528.7s` to `Ready` and
+  about `43.1s` TTFT.
 
 ## Known Limitations
 
@@ -1984,11 +2016,11 @@ manual `past_key_values.*` cache management for the `model_kv*` files.
   allocations during cold load.
 - q4f16 keeps q4 weights but uses float32 runtime tensors in the current browser
   artifact for WebGPU stability.
-- The older `model_q4f16.onnx` and `model_quantized.onnx` files are
-  full-sequence fallbacks and are slower than the `model_kv*` cached files.
-- The default browser path is full-sequence q4f16, so generation is slow. The
-  latest local Chrome smoke measured about `0.61 tok/s` on an M4 Pro.
-- Cached KV-cache loading remains experimental in Chrome/WebGPU.
+- Cached q4f16 is faster after the first token, but first load and first-token
+  latency are still slow.
+- The displayed tok/sec is a rolling token-latency rate, not a cold-start
+  average.
+- The older full-sequence artifacts remain slower fallbacks.
 
 ## Attribution
 
@@ -2085,6 +2117,10 @@ def quantize_q4_model(
     return quantized_model
 
 
+def is_kv_base_model(base_model_name: str) -> bool:
+    return base_model_name.startswith("model_kv")
+
+
 def quantize_with_onnxruntime(
     onnx_dir: Path,
     q4_block_size: int,
@@ -2122,7 +2158,7 @@ def quantize_with_onnxruntime(
             q4_folded_matmuls = fold_matmul_initializer_chains(q4_model, force_float16=False)
             print(json.dumps({"preprocess": "q4_fold_matmul_initializer_chains", "folded_matmuls": q4_folded_matmuls}, indent=2), flush=True)
             q4_nodes_to_exclude = []
-            if base_model_name == "model_kv" and not quantize_kv_attention_projections:
+            if is_kv_base_model(base_model_name) and (not quantize_kv_attention_projections or kv_q4_exclude_patterns):
                 q4_nodes_to_exclude = matmul_nodes_for_weight_patterns(q4_model, kv_q4_exclude_patterns)
             if q4_nodes_to_exclude:
                 print(
@@ -2204,7 +2240,7 @@ def quantize_with_onnxruntime(
                 flush=True,
             )
         q8_nodes_to_exclude = []
-        if base_model_name == "model_kv" and not quantize_kv_attention_projections:
+        if is_kv_base_model(base_model_name) and (not quantize_kv_attention_projections or kv_q8_exclude_patterns):
             q8_nodes_to_exclude = matmul_nodes_for_weight_patterns(q8_model, kv_q8_exclude_patterns)
         if q8_nodes_to_exclude:
             print(
@@ -2218,7 +2254,7 @@ def quantize_with_onnxruntime(
                 ),
                 flush=True,
             )
-    q8_op_types = {"MatMul"} if base_model_name == "model_kv" else set(IntegerOpsRegistry.keys())
+    q8_op_types = {"MatMul"} if is_kv_base_model(base_model_name) else set(IntegerOpsRegistry.keys())
     q8_quantizer = ONNXQuantizer(
         q8_model,
         per_channel=False,
@@ -2318,6 +2354,20 @@ def upload_to_hub(
             "onnx/model_kv_quantized.onnx_data*",
         ]
         delete_patterns = ["onnx/model_kv.onnx", "onnx/model_kv.onnx_data*", "onnx/model_kv_fp16*"]
+    elif not upload_fp_model and base_model_name == "model_kv_fast":
+        merge_remote_transformers_js_config(out_dir, repo_id, token)
+        allow_patterns = [
+            "config.json",
+            "onnx/model_kv_fast_q4f16.onnx",
+            "onnx/model_kv_fast_q4f16.onnx_data*",
+            "onnx/model_kv_fast_quantized.onnx",
+            "onnx/model_kv_fast_quantized.onnx_data*",
+        ]
+        delete_patterns = [
+            "onnx/model_kv_fast.onnx",
+            "onnx/model_kv_fast.onnx_data*",
+            "onnx/model_kv_fast_fp16*",
+        ]
     elif not upload_fp_model and base_model_name == "browser":
         allow_patterns = [
             "README.md",
@@ -2330,13 +2380,32 @@ def upload_to_hub(
             "onnx/model_kv_q4f16.onnx_data*",
             "onnx/model_kv_quantized.onnx",
             "onnx/model_kv_quantized.onnx_data*",
+            "onnx/model_kv_fast_q4f16.onnx",
+            "onnx/model_kv_fast_q4f16.onnx_data*",
+            "onnx/model_kv_fast_quantized.onnx",
+            "onnx/model_kv_fast_quantized.onnx_data*",
         ]
-        delete_patterns = ["onnx/model.onnx", "onnx/model.onnx_data*", "onnx/model_fp16*", "onnx/model_kv.onnx", "onnx/model_kv.onnx_data*", "onnx/model_kv_fp16*"]
+        delete_patterns = [
+            "onnx/model.onnx",
+            "onnx/model.onnx_data*",
+            "onnx/model_fp16*",
+            "onnx/model_kv.onnx",
+            "onnx/model_kv.onnx_data*",
+            "onnx/model_kv_fp16*",
+            "onnx/model_kv_fast.onnx",
+            "onnx/model_kv_fast.onnx_data*",
+            "onnx/model_kv_fast_fp16*",
+        ]
+    commit_message = "Add Talkie ONNX WebGPU export"
+    if base_model_name == "model_kv":
+        commit_message = "Add Talkie KV-cache ONNX WebGPU export"
+    elif base_model_name == "model_kv_fast":
+        commit_message = "Add Talkie fast KV-cache ONNX WebGPU export"
     api.upload_folder(
         repo_id=repo_id,
         repo_type="model",
         folder_path=str(out_dir),
-        commit_message="Add Talkie KV-cache ONNX WebGPU export" if base_model_name == "model_kv" else "Add Talkie ONNX WebGPU export",
+        commit_message=commit_message,
         allow_patterns=allow_patterns,
         delete_patterns=delete_patterns,
     )
@@ -2350,6 +2419,8 @@ def upload_model_names(base_model_name: str, upload_fp_model: bool) -> tuple[str
         return FULL_SEQUENCE_ONNX_FILES
     if base_model_name == "model_kv":
         return KV_CACHE_ONNX_FILES
+    if base_model_name == "model_kv_fast":
+        return FAST_KV_CACHE_ONNX_FILES
     if base_model_name == "browser":
         return BROWSER_ONNX_FILES
     return ()
@@ -2438,6 +2509,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-q8-folded", action="store_true", help="Write onnx/model_fp16_folded.onnx and exit")
     parser.add_argument("--q8-source-path", default=None, help="Use a preprocessed ONNX source for q8 quantization")
     parser.add_argument("--kv-cache", action="store_true", help="Export model_kv*.onnx with past/present KV-cache tensors")
+    parser.add_argument(
+        "--kv-cache-fast",
+        action="store_true",
+        help="Export additive model_kv_fast*.onnx artifacts with KV attention projections quantized.",
+    )
     parser.add_argument("--kv-export-past-len", type=int, default=1, help="Dummy past length used when tracing the KV-cache graph")
     parser.add_argument(
         "--split-external-data",
@@ -2473,11 +2549,18 @@ def resolve_export_compute_dtype(name: str, source_dtype: torch.dtype) -> torch.
 
 def main() -> None:
     args = parse_args()
+    if args.kv_cache_fast:
+        args.kv_cache = True
+        args.quantize_kv_attention_projections = True
+        if args.kv_q4_exclude_attn_projections == "query,key,value":
+            args.kv_q4_exclude_attn_projections = "value"
+        if args.kv_q8_exclude_attn_projections == "key,value":
+            args.kv_q8_exclude_attn_projections = "value"
     token = ensure_token()
     work_dir = Path(args.work_dir)
     out_dir = work_dir / "hub"
     onnx_dir = out_dir / "onnx"
-    base_model_name = "model_kv" if args.kv_cache else "model"
+    base_model_name = "model_kv_fast" if args.kv_cache_fast else ("model_kv" if args.kv_cache else "model")
     model_path = onnx_dir / f"{base_model_name}.onnx"
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -2494,6 +2577,8 @@ def main() -> None:
                 "q4_block_size": args.q4_block_size,
                 "q4_accuracy_level": args.q4_accuracy_level,
                 "kv_cache": args.kv_cache,
+                "kv_cache_fast": args.kv_cache_fast,
+                "quantize_kv_attention_projections": args.quantize_kv_attention_projections,
                 "base_model_name": base_model_name,
                 "work_dir": str(work_dir),
             },
@@ -2721,6 +2806,7 @@ def main() -> None:
                     "q4f16_kv",
                     reference_top5=reference_top5,
                     require_top1_match=False,
+                    providers=["CPUExecutionProvider"] if args.kv_cache_fast else None,
                 )
             else:
                 q4_result = validate_onnx(

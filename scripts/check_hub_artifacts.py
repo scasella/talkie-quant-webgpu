@@ -29,6 +29,13 @@ EXPECTED_KV = {
     "onnx/model_kv_quantized.onnx",
 }
 EXPECTED_KV_EXTERNAL_MODELS = ("model_kv_q4f16.onnx", "model_kv_quantized.onnx")
+EXPECTED_FAST_KV = {
+    "onnx/model_kv_fast_q4f16.onnx",
+    "onnx/model_kv_fast_quantized.onnx",
+}
+EXPECTED_FAST_KV_Q4 = {"onnx/model_kv_fast_q4f16.onnx"}
+EXPECTED_FAST_KV_EXTERNAL_MODELS = ("model_kv_fast_q4f16.onnx", "model_kv_fast_quantized.onnx")
+EXPECTED_FAST_KV_Q4_EXTERNAL_MODELS = ("model_kv_fast_q4f16.onnx",)
 EXPECTED_EXTERNAL_CHUNKS = {
     "model_q4f16.onnx": 22,
     "model_quantized.onnx": 31,
@@ -42,6 +49,8 @@ def main() -> None:
     parser.add_argument("repo_id", nargs="?", default="scasella91/talkie-1930-13b-it-ONNX")
     parser.add_argument("--revision", default="main")
     parser.add_argument("--require-kv", action="store_true", help="Require the cached model_kv q4/q8 artifacts")
+    parser.add_argument("--require-fast-kv-q4", action="store_true", help="Require additive model_kv_fast q4f16 artifact")
+    parser.add_argument("--require-fast-kv", action="store_true", help="Require additive model_kv_fast q4/q8 artifacts")
     args = parser.parse_args()
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -52,6 +61,12 @@ def main() -> None:
     if args.require_kv:
         expected |= EXPECTED_KV
         expected_external_models.extend(EXPECTED_KV_EXTERNAL_MODELS)
+    if args.require_fast_kv:
+        expected |= EXPECTED_FAST_KV
+        expected_external_models.extend(EXPECTED_FAST_KV_EXTERNAL_MODELS)
+    elif args.require_fast_kv_q4:
+        expected |= EXPECTED_FAST_KV_Q4
+        expected_external_models.extend(EXPECTED_FAST_KV_Q4_EXTERNAL_MODELS)
     missing = sorted(expected - files)
     external_data = sorted(path for path in files if path.startswith("onnx/") and ".onnx_data" in path)
 
@@ -75,9 +90,11 @@ def main() -> None:
     bad_external_entries = []
     for name in expected_external_models:
         actual = int(external_format.get(name, 0))
-        expected_count = EXPECTED_EXTERNAL_CHUNKS[name]
-        if actual != expected_count:
+        expected_count = EXPECTED_EXTERNAL_CHUNKS.get(name)
+        if expected_count is not None and actual != expected_count:
             bad_external_entries.append({"file": name, "expected": expected_count, "actual": actual})
+        elif expected_count is None and actual <= 0:
+            bad_external_entries.append({"file": name, "expected": "positive chunk count", "actual": actual})
     if bad_external_entries:
         print("config.json has incorrect Transformers.js external-data entries:")
         print(json.dumps(bad_external_entries, indent=2))

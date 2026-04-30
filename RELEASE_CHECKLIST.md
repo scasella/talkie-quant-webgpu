@@ -7,18 +7,23 @@ Use this checklist before publishing or tagging the repo.
 - GitHub repo: `scasella/talkie-quant-webgpu`
 - Live demo: `https://scasella.github.io/talkie-quant-webgpu/`
 - Hub repo: `scasella91/talkie-1930-13b-it-ONNX`
-- Validated ONNX artifact commit: `8353531db9d507d96b8a92f5aceb12ff71b6b753`
-- Browser default: `onnx/model_q4f16.onnx`
-- Cached q4 artifact: `onnx/model_kv_q4f16.onnx`, `32` chunks, `16.53 GB`
+- Validated ONNX artifact commit: `631cbea56319f30469aae41af8fbd3078c460b3b`
+- Browser default: `onnx/model_kv_fast_q4f16.onnx`
+- Fast cached q4 artifact: `onnx/model_kv_fast_q4f16.onnx`, `55` chunks,
+  about `13.0 GB`
+- Cached q4 fallback: `onnx/model_kv_q4f16.onnx`, `32` chunks, `16.53 GB`
 - Cached q8 fallback: `onnx/model_kv_quantized.onnx`
 - Cached q8 external-data chunks: `42` chunks, `21.60 GB`
 - Full-sequence q4 fallback: `onnx/model_q4f16.onnx`, `22` chunks
 - Full-sequence q8 fallback: `onnx/model_quantized.onnx`, `31` chunks
 - Smoke prompt target: at least `16` streamed non-NUL words over WebGPU
-- Current browser gate: passed in Chromium on a 24 GB M4 Pro using
-  full-sequence q4f16, `cache=0`, and ONNX Runtime graph optimization disabled.
-  Evidence: load reached `Ready` in about 8 minutes and generated 16 non-NUL
-  words at about `0.61 tok/s`.
+- Current browser gate: passed in Chromium on a 24 GB M4 Pro using cached
+  q4f16 direct ORT, `cache=0`, `opt=disabled`, and `fetches=6`. Evidence:
+  load reached `Ready` in about `528.7s`, TTFT was about `43.1s`, and the run
+  generated 16 non-NUL words with `kv-cache` / `ort-direct`, about `3.17 tok/s`
+  reported rolling latency, and about `3.11 tok/s` p50 token latency.
+- Full-sequence q4f16 fallback previously generated 16 non-NUL words at about
+  `0.61 tok/s`.
 
 ## Required Checks
 
@@ -26,8 +31,8 @@ Use this checklist before publishing or tagging the repo.
 npm run build
 npm run build:pages
 python3 -m py_compile scripts/*.py
-python3 scripts/check_hub_artifacts.py --require-kv scasella91/talkie-1930-13b-it-ONNX
-TALKIE_WEB_URL=https://scasella.github.io/talkie-quant-webgpu/ TALKIE_WEB_EXPECTED_DTYPE=q4f16 TALKIE_WEB_MIN_TOKENS=16 python3 scripts/validate_browser_webgpu.py
+python3 scripts/check_hub_artifacts.py --require-kv --require-fast-kv-q4 scasella91/talkie-1930-13b-it-ONNX
+TALKIE_WEB_URL='http://127.0.0.1:5173/?fetches=6' TALKIE_BENCH_TARGETS=cached-q4f16 TALKIE_BENCH_RUNS=1 TALKIE_WEB_MIN_TOKENS=16 npm run benchmark:browser
 ```
 
 ## Hygiene

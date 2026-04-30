@@ -29,46 +29,47 @@ for browser inference with Transformers.js.
 - Live browser demo: <https://scasella.github.io/talkie-quant-webgpu/>
 - GitHub runner and export scripts: <https://github.com/scasella/talkie-quant-webgpu>
 - Source model revision: `6311dedf518470856a8503f2080bb4b54fcb3323`
-- Validated ONNX artifact commit: `8353531db9d507d96b8a92f5aceb12ff71b6b753`
+- Validated ONNX artifact commit: `631cbea56319f30469aae41af8fbd3078c460b3b`
 - Default browser dtype: `q4f16`
 - Fallback dtype: `q8`
 - Stop token IDs: `[65535, 65536]`
 
 This model keeps the source tokenizer, chat template, generation config, and
 Apache-2.0 license metadata. It is not an official Talkie release. The ONNX
-artifacts validate outside the browser, and the smaller full-sequence q4f16 path
-has passed a Chrome/WebGPU smoke on a 24 GB M4 Pro. Cached KV-cache artifacts
-are published but still experimental in the browser.
+artifacts validate outside the browser. The default fast cached q4f16 path has
+also passed a Chrome/WebGPU smoke on a 24 GB M4 Pro with direct ONNX Runtime
+WebGPU.
 
 Later model-card-only commits may move this repo's HEAD without changing the
 validated ONNX artifacts.
 
 ## Quantization At A Glance
 
-The preferred performance direction is the **cached q4f16 ONNX** file:
-**16.53 GB** across **32** external-data chunks. It is larger than the smaller
-full-sequence q4 artifact because the cached export intentionally leaves the
-key/value projections that build the KV cache unquantized, which keeps cached
-logits aligned with the source model while avoiding a full prompt re-run on
-every generated token.
+The default browser artifact is the **fast cached q4f16 ONNX** file: about
+**13.0 GB** across **55** smaller external-data chunks. It quantizes query/key
+attention projections while leaving value projections unquantized, preserving
+top-1 agreement on the smoke prompt and avoiding a full prompt re-run on every
+generated token.
 
 | Artifact | Size | Reduction vs source | Notes |
 | --- | ---: | ---: | --- |
 | BF16 source safetensors | 26.56&nbsp;GB | baseline | `lewtun/talkie-1930-13b-it-hf` |
-| Cached q4f16 ONNX | 16.53&nbsp;GB | 38% smaller | Experimental KV-cache browser path; most MatMuls q4, K/V projections unquantized |
+| Fast cached q4f16 ONNX default | 13.0&nbsp;GB | 51% smaller | Direct ORT KV-cache browser path; q/k quantized, value unquantized |
+| Cached q4f16 ONNX fallback | 16.53&nbsp;GB | 38% smaller | KV-cache fallback; q/k/v projections unquantized |
 | Cached q8 ONNX fallback | 21.60&nbsp;GB | 19% smaller | KV-cache fallback; K/V projections unquantized |
 | Full-sequence q4f16 fallback | 10.58&nbsp;GB | 60% smaller | Smaller download, slower generation |
 | Full-sequence q8 fallback | 15.31&nbsp;GB | 42% smaller | Full-prompt fallback path |
 
 The q4f16 files are larger than a theoretical pure 4-bit checkpoint because
-ONNX stores scales, metadata, and unquantized tensors. The cached files trade a
-larger first download for faster per-token decoding.
+ONNX stores scales, metadata, and unquantized tensors. The cached files trade
+first-load size for faster steady per-token decoding.
 
 ## Files
 
 | File | Runtime dtype | Use | External chunks |
 | --- | --- | --- | ---: |
-| `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Preferred cached browser path, 16.53&nbsp;GB | 32 |
+| `onnx/model_kv_fast_q4f16.onnx` | hybrid q4f16 | Default direct ORT cached browser path, about 13.0&nbsp;GB | 55 |
+| `onnx/model_kv_q4f16.onnx` | hybrid q4f16 | Conservative cached fallback, 16.53&nbsp;GB | 32 |
 | `onnx/model_kv_quantized.onnx` | hybrid q8 | Cached fallback path, 21.60&nbsp;GB | 42 |
 | `onnx/model_q4f16.onnx` | q4 weights, WebGPU-safe runtime tensors | Full-sequence fallback, 10.58&nbsp;GB | 22 |
 | `onnx/model_quantized.onnx` | q8 | Full-sequence fallback, 15.31&nbsp;GB | 31 |
@@ -93,10 +94,8 @@ npm install
 npm run dev
 ```
 
-The app defaults to the smaller full-sequence q4f16 artifact and exposes cached
-q4f16 as an explicit option. Cached q4f16 is the preferred performance direction
-because it avoids rerunning the full prompt every token, but it is still an
-experimental Chrome/WebGPU load path.
+The app defaults to cached q4f16. The smaller full-sequence q4f16 artifact
+remains available as a fallback.
 
 ## Transformers.js Notes
 
@@ -105,7 +104,7 @@ used here. The browser runner formats messages with the shipped chat template,
 tokenizes them, runs an explicit manual generation loop, samples on the CPU,
 suppresses token `0`, and stops on token IDs `65535` or `65536`.
 
-Minimal loading sketch:
+Minimal tokenizer and fallback-model loading sketch:
 
 ```ts
 import { AutoModel, AutoTokenizer } from "@huggingface/transformers";
@@ -118,20 +117,25 @@ const model = await AutoModel.from_pretrained(repo, {
 });
 ```
 
-Use the GitHub runner for the complete manual generation loop, including manual
+Use the GitHub runner for the complete manual generation loop, including direct
+ONNX Runtime loading, limited concurrent model fetches, and manual
 `past_key_values.*` cache management for the cached files.
 
 ## Validation
 
 - Hub artifact validation confirms tokenizer/config files, ONNX files, and all
-  q4/q8 external-data chunks.
-- The cached q4f16 artifact validated against the PyTorch full-sequence wrapper
-  on CUDA and CPU providers.
+  q4/q8 external-data chunks, including the additive fast cached q4 artifact.
+- The additive fast cached q4f16 artifact validated top-1 against the PyTorch
+  full-sequence wrapper with value projection left unquantized. The all-projection
+  fast q4 attempt failed top-5 validation and was not made the default.
 - The cached q8 fallback validated against the same reference on the CPU
   provider and is kept as a browser/WebGPU fallback.
-- Chromium on a 24 GB M4 Pro loaded full-sequence q4f16 with `cache=0` and ONNX
-  Runtime graph optimization disabled, then generated 16 non-NUL words at about
-  `0.61 tok/s`.
+- Chromium on a 24 GB M4 Pro loaded cached q4f16 with `cache=0`,
+  `opt=disabled`, and `fetches=6`, then generated 16 non-NUL words with
+  `kv-cache` / `ort-direct`, about `3.17 tok/s` reported rolling latency, and
+  about `3.11 tok/s` p50 token latency.
+- Cold load remains slow: the measured run took about `528.7s` to `Ready` and
+  about `43.1s` TTFT.
 - Direct ORT and app loads with default graph optimization failed with
   `std::bad_alloc`; `opt=disabled` is the browser-safe default.
 
@@ -144,7 +148,7 @@ python3 scripts/check_hub_artifacts.py scasella91/talkie-1930-13b-it-ONNX
 Require the cached KV artifacts after republishing:
 
 ```bash
-python3 scripts/check_hub_artifacts.py --require-kv scasella91/talkie-1930-13b-it-ONNX
+python3 scripts/check_hub_artifacts.py --require-kv --require-fast-kv-q4 scasella91/talkie-1930-13b-it-ONNX
 ```
 
 ## Known Limitations
@@ -155,11 +159,11 @@ python3 scripts/check_hub_artifacts.py --require-kv scasella91/talkie-1930-13b-i
   allocations during cold load.
 - q4f16 keeps q4 weights but uses float32 runtime tensors in the current browser
   artifact for WebGPU stability.
-- Cached decoding is the preferred path once `model_kv*` artifacts are present;
-  the older full-sequence artifacts remain slower fallbacks.
-- The default browser path is full-sequence q4f16, so generation is slow. The
-  latest local Chrome smoke measured about `0.61 tok/s` on an M4 Pro.
-- Cached KV-cache loading remains experimental in Chrome/WebGPU.
+- Cached q4f16 is faster after the first token, but first load and first-token
+  latency are still slow.
+- The displayed tok/sec is a rolling token-latency rate, not a cold-start
+  average.
+- The older full-sequence artifacts remain slower fallbacks.
 - This repo is public and assumes unauthenticated browser loading. Do not embed
   private Hugging Face tokens in browser code.
 
