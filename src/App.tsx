@@ -40,7 +40,7 @@ const defaultSettings: GenerationSettings = {
   topK: 50
 };
 
-type LoadTarget = "kv-q4f16" | "kv-q8" | "full-q4f16" | "full-q8";
+type LoadTarget = "kv-fast-q4f16" | "kv-q4f16" | "kv-q8" | "full-q4f16" | "full-q8";
 
 interface FileLoadState {
   loaded: number;
@@ -62,6 +62,11 @@ const DEFAULT_LOAD_METER: LoadMeter = {
 const DEFAULT_LOAD_PATH = defaultLoadPath();
 
 const TARGETS: Record<LoadTarget, { label: string; bytes: number; needles: string[] }> = {
+  "kv-fast-q4f16": {
+    label: "fast cached q4f16",
+    bytes: 12_990_460_748,
+    needles: ["model_kv_fast_q4f16.onnx"]
+  },
   "kv-q4f16": {
     label: "cached q4f16",
     bytes: 16_529_366_674,
@@ -294,7 +299,7 @@ function App() {
                 onChange={(event) => setLoadPath(event.currentTarget.value as LoadPath)}
                 disabled={loading || generating}
               >
-                <option value="cached">Cached q4f16</option>
+                <option value="cached">Fast cached q4f16</option>
                 <option value="full">Smaller q4f16</option>
               </select>
             </label>
@@ -418,10 +423,11 @@ function updateLoadMeter(
 
   const loaded = finiteNumber(event.loaded);
   const total = finiteNumber(event.total);
-  if (file && loaded != null && total != null && total > 0) {
+  if (file && loaded != null) {
+    const boundedTotal = total != null && total > 0 ? total : Math.max(loaded, 1);
     files.set(file, {
-      loaded: Math.min(Math.max(loaded, 0), total),
-      total
+      loaded: Math.min(Math.max(loaded, 0), boundedTotal),
+      total: boundedTotal
     });
   }
 
@@ -452,6 +458,7 @@ function aggregateTargetPercent(files: Map<string, FileLoadState>, target: LoadT
 }
 
 function detectLoadTarget(file: string): LoadTarget | null {
+  if (file.includes("model_kv_fast_q4f16.onnx")) return "kv-fast-q4f16";
   if (file.includes("model_kv_q4f16.onnx")) return "kv-q4f16";
   if (file.includes("model_kv_quantized.onnx")) return "kv-q8";
   if (file.includes("model_q4f16.onnx")) return "full-q4f16";

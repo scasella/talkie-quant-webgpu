@@ -314,6 +314,12 @@ using Chrome/WebGPU:
   warms shapes. The displayed tok/sec is a rolling token-latency rate, not a
   cold-start average.
 - The older full-sequence artifacts remain slower fallbacks.
+- If Chrome logs 404s for generic filenames such as `onnx/model.onnx`,
+  `onnx/model_uint8.onnx`, or `onnx/model_q4.onnx`, the browser is running an
+  older app bundle that used Transformers.js dtype probing. The published
+  artifacts use explicit filenames such as `onnx/model_kv_fast_q4f16.onnx`.
+  Hard refresh the demo, or open it in a fresh profile, so the latest bundle is
+  used.
 
 ## Advanced: Reproduce ONNX Artifacts
 

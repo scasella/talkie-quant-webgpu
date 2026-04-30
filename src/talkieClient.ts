@@ -4,12 +4,11 @@ import {
   AutoTokenizer,
   env,
   LogLevel,
-  ModelRegistry,
   Tensor as HfTensor
 } from "@huggingface/transformers";
 import * as ort from "onnxruntime-web/webgpu";
 import { waitForTalkieFetchRetry } from "./fetchRetry";
-import { installTalkieFetchLimiter } from "./fetchLimiter";
+import { installTalkieFetchLimiter, setTalkieFetchProgressListener } from "./fetchLimiter";
 
 export type Role = "system" | "user" | "assistant";
 
@@ -65,6 +64,7 @@ const RUNTIME_PARAMS = runtimeSearchParams();
 const MODEL_ID = RUNTIME_PARAMS.get("model") || import.meta.env.VITE_TALKIE_ONNX_MODEL_ID || DEFAULT_MODEL_ID;
 const REVISION = RUNTIME_PARAMS.get("revision") || import.meta.env.VITE_TALKIE_ONNX_REVISION || DEFAULT_REVISION;
 const DTYPE_OVERRIDE = RUNTIME_PARAMS.get("dtype") || import.meta.env.VITE_TALKIE_ONNX_DTYPE;
+const LOAD_PATH_OVERRIDE = RUNTIME_PARAMS.get("path");
 const CACHE_OVERRIDE = RUNTIME_PARAMS.get("cache");
 const GRAPH_OPTIMIZATION_LEVEL =
   RUNTIME_PARAMS.get("opt") || import.meta.env.VITE_TALKIE_GRAPH_OPTIMIZATION || "disabled";
@@ -72,6 +72,14 @@ const DIRECT_CACHED_ENABLED =
   RUNTIME_PARAMS.get("direct") !== "0" && import.meta.env.VITE_TALKIE_DIRECT_CACHED !== "0";
 const BROWSER_CACHE_ENABLED =
   CACHE_OVERRIDE === "1" || (CACHE_OVERRIDE !== "0" && import.meta.env.VITE_TALKIE_BROWSER_CACHE === "1");
+const DEFAULT_LOAD_PATH: LoadPath =
+  LOAD_PATH_OVERRIDE === "full"
+    ? "full"
+    : LOAD_PATH_OVERRIDE === "cached"
+      ? "cached"
+      : import.meta.env.VITE_TALKIE_LOAD_PATH === "full"
+        ? "full"
+        : "cached";
 
 const ONNX_CHUNK_COUNTS: Record<string, number> = {
   "model_kv_q4f16.onnx": 32,
@@ -126,7 +134,7 @@ export async function resetTalkieRuntime(): Promise<void> {
 }
 
 export async function loadTalkieRuntime(onProgress?: ProgressCallback, loadPath?: LoadPath): Promise<Runtime> {
-  const requestedPath = loadPath ?? runtimePath ?? "full";
+  const requestedPath = loadPath ?? runtimePath ?? DEFAULT_LOAD_PATH;
   if (runtimePromise && runtimePath === requestedPath) return runtimePromise;
   if (runtimePromise && runtimePath !== requestedPath) {
     await resetTalkieRuntime();
@@ -141,11 +149,6 @@ export async function loadTalkieRuntime(onProgress?: ProgressCallback, loadPath?
 
     installTalkieFetchLimiter();
     configureDirectOrtRuntime();
-    const dtypes = await getAvailableDtypes();
-    const explicitDtype = DTYPE_OVERRIDE && DTYPE_OVERRIDE !== "auto" ? DTYPE_OVERRIDE : null;
-    const hasExplicitDtype = explicitDtype != null;
-    const preferred = explicitDtype ? [explicitDtype] : ["q4f16", "q4", "q8", "fp16", "fp32"];
-    const dtype = preferred.find((candidate) => dtypes.includes(candidate)) ?? "q4f16";
 
     const progress_callback = (event: LoadProgress) => {
       onProgress?.(event);
@@ -155,6 +158,12 @@ export async function loadTalkieRuntime(onProgress?: ProgressCallback, loadPath?
       revision: REVISION,
       progress_callback
     } as any);
+    const dtypes = getAvailableDtypes(config);
+    const explicitDtype = DTYPE_OVERRIDE && DTYPE_OVERRIDE !== "auto" ? DTYPE_OVERRIDE : null;
+    const hasExplicitDtype = explicitDtype != null;
+    const preferred = explicitDtype ? [explicitDtype] : ["q4f16", "q4", "q8", "fp16", "fp32"];
+    const dtype = preferred.find((candidate) => dtypes.includes(candidate)) ?? "q4f16";
+
     const tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, {
       revision: REVISION,
       progress_callback
@@ -198,13 +207,27 @@ export async function loadTalkieRuntime(onProgress?: ProgressCallback, loadPath?
   return runtimePromise;
 }
 
-async function getAvailableDtypes(): Promise<string[]> {
-  try {
-    const dtypes = await ModelRegistry.get_available_dtypes(MODEL_ID, { revision: REVISION } as any);
-    return Array.isArray(dtypes) ? dtypes : [];
-  } catch {
-    return [];
+function getAvailableDtypes(config: any): string[] {
+  const externalData = config?.["transformers.js_config"]?.use_external_data_format ?? {};
+  const files = new Set(Object.keys(externalData));
+  const dtypes: string[] = [];
+  if (
+    files.has("model_kv_fast_q4f16.onnx") ||
+    files.has("model_kv_q4f16.onnx") ||
+    files.has("model_q4f16.onnx")
+  ) {
+    dtypes.push("q4f16");
   }
+  if (
+    files.has("model_kv_fast_quantized.onnx") ||
+    files.has("model_kv_quantized.onnx") ||
+    files.has("model_quantized.onnx")
+  ) {
+    dtypes.push("q8");
+  }
+  const configured = config?.["transformers.js_config"]?.dtype;
+  if (typeof configured === "string" && !dtypes.includes(configured)) dtypes.push(configured);
+  return dtypes.length > 0 ? dtypes : ["q4f16", "q8"];
 }
 
 export async function generateTalkieReply(
@@ -799,12 +822,26 @@ async function loadDirectOrtModel(
   progress_callback({ status: `Loading direct ${attempt.dtype} kv-cache` });
   await waitForTalkieFetchRetry();
 
-  const session = await ort.InferenceSession.create(hubOnnxUrl(attempt.onnxFileName), {
-    executionProviders: ["webgpu"],
-    externalData: externalDataForModel(attempt.onnxFileName, config),
-    graphOptimizationLevel: GRAPH_OPTIMIZATION_LEVEL as ort.InferenceSession.SessionOptions["graphOptimizationLevel"],
-    preferredOutputLocation: directPreferredOutputLocation(config)
+  setTalkieFetchProgressListener((event) => {
+    progress_callback({
+      status: `Fetching direct ${attempt.dtype} ONNX chunks`,
+      file: event.url,
+      loaded: event.loaded,
+      total: event.total
+    });
   });
+
+  let session: ort.InferenceSession | null = null;
+  try {
+    session = await ort.InferenceSession.create(hubOnnxUrl(attempt.onnxFileName), {
+      executionProviders: ["webgpu"],
+      externalData: externalDataForModel(attempt.onnxFileName, config),
+      graphOptimizationLevel: GRAPH_OPTIMIZATION_LEVEL as ort.InferenceSession.SessionOptions["graphOptimizationLevel"],
+      preferredOutputLocation: directPreferredOutputLocation(config)
+    });
+  } finally {
+    setTalkieFetchProgressListener(null);
+  }
 
   const cacheInputNames = session.inputNames.filter((name) => name.startsWith("past_key_values."));
   const cacheOutputNames = session.outputNames.filter((name) => name.startsWith("present."));
