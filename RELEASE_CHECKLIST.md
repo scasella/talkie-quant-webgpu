@@ -7,7 +7,7 @@ Use this checklist before publishing or tagging the repo.
 - GitHub repo: `scasella/talkie-quant-webgpu`
 - Live demo: `https://scasella.github.io/talkie-quant-webgpu/`
 - Hub repo: `scasella91/talkie-1930-13b-it-ONNX`
-- Latest GitHub release target: `v0.2.0` fast cached WebGPU path
+- Latest GitHub release: `v0.2.0` fast cached WebGPU path
 - Validated ONNX artifact commit: `631cbea56319f30469aae41af8fbd3078c460b3b`
 - Latest HF model-card update: `f10c5bb2a011617597546ab9d96b9cf482112bce`
 - Browser default: `onnx/model_kv_fast_q4f16.onnx`
