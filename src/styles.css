@@ -11,10 +11,16 @@
   box-sizing: border-box;
 }
 
+html,
+#root {
+  height: 100%;
+}
+
 body {
   margin: 0;
   min-width: 320px;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   background:
     linear-gradient(rgba(247, 245, 238, 0.91), rgba(247, 245, 238, 0.91)),
     url("./assets/talkie-pattern.svg");
@@ -66,12 +72,14 @@ button:disabled {
 }
 
 .shell {
-  min-height: 100vh;
+  height: 100vh;
   padding: 22px;
+  overflow: hidden;
 }
 
 .workspace {
-  min-height: calc(100vh - 44px);
+  height: calc(100vh - 44px);
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border: 2px solid #151514;
@@ -132,6 +140,7 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(220px, 280px) 1fr;
   min-height: 0;
+  overflow: hidden;
 }
 
 .controls {
@@ -141,6 +150,8 @@ button:disabled {
   flex-direction: column;
   gap: 10px;
   background: #f7f5ee;
+  min-height: 0;
+  overflow: auto;
 }
 
 .controls label {
@@ -227,15 +238,18 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: 1fr auto auto;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  overflow: hidden;
 }
 
 .messages {
   overflow: auto;
+  min-height: 0;
   padding: 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+  overscroll-behavior: contain;
 }
 
 .message {
@@ -302,7 +316,17 @@ button:disabled {
 
 .composer button {
   align-self: end;
-  min-width: 96px;
+  min-width: 164px;
+}
+
+.composer kbd {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 2px 5px;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.85;
 }
 
 .spin {
@@ -321,7 +345,7 @@ button:disabled {
   }
 
   .workspace {
-    min-height: calc(100vh - 20px);
+    height: calc(100vh - 20px);
   }
 
   .topbar {
@@ -335,6 +359,7 @@ button:disabled {
 
   .body {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .controls {
@@ -342,6 +367,7 @@ button:disabled {
     border-bottom: 2px solid #151514;
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    max-height: min(280px, 36vh);
   }
 
   .controls label,

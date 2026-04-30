@@ -1,4 +1,4 @@
-import { type FormEvent, type MutableRefObject, useMemo, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent, type MutableRefObject, useEffect, useMemo, useRef, useState } from "react";
 import {
   ExternalLink,
   Gauge,
@@ -107,9 +107,16 @@ function App() {
   const loadFilesRef = useRef<Map<string, FileLoadState>>(new Map());
   const loadTargetRef = useRef<LoadTarget | null>(null);
   const bestLoadPercentRef = useRef(0);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
 
   const defaults = useMemo(() => modelDefaults(), []);
   const gpuReady = hasWebGPU();
+
+  useEffect(() => {
+    const element = messagesRef.current;
+    if (!element) return;
+    element.scrollTop = element.scrollHeight;
+  }, [messages]);
 
   const handleProgress = (event: LoadProgress) => {
     setLoadMeter(updateLoadMeter(event, loadFilesRef.current, loadTargetRef, bestLoadPercentRef));
@@ -207,8 +214,12 @@ function App() {
     setMessages(initialMessages);
   };
 
-  const send = async (event: FormEvent) => {
+  const send = (event: FormEvent) => {
     event.preventDefault();
+    void sendDraft();
+  };
+
+  const sendDraft = async () => {
     const prompt = draft.trim();
     if (!prompt || generating) return;
 
@@ -250,6 +261,12 @@ function App() {
       abortRef.current = null;
       setGenerating(false);
     }
+  };
+
+  const submitOnShortcut = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!event.metaKey || event.key !== "Enter") return;
+    event.preventDefault();
+    void sendDraft();
   };
 
   return (
@@ -370,7 +387,7 @@ function App() {
           </aside>
 
           <section className="chat" aria-label="Conversation">
-            <div className="messages">
+            <div className="messages" ref={messagesRef}>
               {messages.map((message, index) => (
                 <article className={`message ${message.role}`} key={`${message.role}-${index}`}>
                   <span>{message.role}</span>
@@ -385,6 +402,7 @@ function App() {
               <textarea
                 value={draft}
                 onChange={(event) => setDraft(event.currentTarget.value)}
+                onKeyDown={submitOnShortcut}
                 placeholder="Ask Talkie..."
                 rows={3}
                 disabled={generating}
@@ -397,7 +415,8 @@ function App() {
               ) : (
                 <button type="submit" className="primary" disabled={!draft.trim()} title="Send">
                   <SendHorizontal size={18} />
-                  Send
+                  <span>Send</span>
+                  <kbd>Cmd+Return</kbd>
                 </button>
               )}
             </form>
